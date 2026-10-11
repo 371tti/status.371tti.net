@@ -1,11 +1,11 @@
-name: Release (v2)
+name: Release (master)
 
 on:
   push:
-    branches: ["v2"]
+    branches: ["master"]
 
 concurrency:
-  group: release-v2
+  group: release-master
   cancel-in-progress: false
 
 permissions:
