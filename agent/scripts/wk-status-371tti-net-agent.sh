@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SERVICE_NAME="wk-status-371tti-net-agent"
 SERVICE_USER="wkstatus-agent"
 BINARY_NAME="wk-status-371tti-net-agent"
+RELEASE_BINARY_URL="https://github.com/371tti/status.371tti.net/releases/latest/download/${BINARY_NAME}"
 CONFIG_DIR="/etc/${SERVICE_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/agent.env"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -12,6 +13,15 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ORIGINAL_ARGS=("$@")
+TEMP_BINARY=""
+SOURCE_BINARY=""
+
+cleanup() {
+  if [[ -n "$TEMP_BINARY" ]]; then
+    rm -f -- "$TEMP_BINARY"
+  fi
+}
+trap cleanup EXIT
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -26,7 +36,7 @@ Usage:
   bash $0 uninstall [--purge]
 
 Commands:
-  install      Install and start the systemd service.
+  install      Install the bundled or latest Release binary and start the service.
   configure    Set the listener, access token, and enabled metric groups.
   uninstall    Remove the service and binary; keep configuration by default.
   --purge      Also remove the configuration and generated token.
@@ -164,28 +174,34 @@ configure() {
 
 find_binary() {
   if [[ -x "${SCRIPT_DIR}/${BINARY_NAME}" ]]; then
-    printf '%s\n' "${SCRIPT_DIR}/${BINARY_NAME}"
+    SOURCE_BINARY="${SCRIPT_DIR}/${BINARY_NAME}"
     return
   fi
   if [[ -x "${WORKSPACE_ROOT}/target/release/${BINARY_NAME}" ]]; then
-    printf '%s\n' "${WORKSPACE_ROOT}/target/release/${BINARY_NAME}"
+    SOURCE_BINARY="${WORKSPACE_ROOT}/target/release/${BINARY_NAME}"
     return
   fi
-  if [[ -f "${WORKSPACE_ROOT}/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
-    cargo build --release --package "$SERVICE_NAME" --manifest-path "${WORKSPACE_ROOT}/Cargo.toml"
-    [[ -x "${WORKSPACE_ROOT}/target/release/${BINARY_NAME}" ]] && {
-      printf '%s\n' "${WORKSPACE_ROOT}/target/release/${BINARY_NAME}"
-      return
-    }
+
+  TEMP_BINARY="$(mktemp)" || fail "Could not create a temporary download file."
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --retry 3 --output "$TEMP_BINARY" "$RELEASE_BINARY_URL" \
+      || fail "Could not download the latest agent binary from GitHub Releases."
+  elif command -v wget >/dev/null 2>&1; then
+    wget --output-document="$TEMP_BINARY" "$RELEASE_BINARY_URL" \
+      || fail "Could not download the latest agent binary from GitHub Releases."
+  else
+    fail "Install curl or wget to download the agent binary from GitHub Releases."
   fi
-  fail "Place ${BINARY_NAME} next to this script or run it from the source workspace with Cargo installed."
+  [[ -s "$TEMP_BINARY" ]] || fail "The downloaded agent binary is empty."
+  chmod 0755 "$TEMP_BINARY"
+  SOURCE_BINARY="$TEMP_BINARY"
 }
 
 install_service() {
-  local source_binary
-  source_binary="$(find_binary)"
   require_root "$@"
   require_linux_systemd
+  find_binary
+  local source_binary="$SOURCE_BINARY"
 
   if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"

@@ -1707,7 +1707,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wk-status-371tti-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "atomicwrites",
  "bytes",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "wk-status-371tti-net-agent"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "writeable"

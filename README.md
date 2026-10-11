@@ -78,9 +78,10 @@ network.unit bytes/s
 
 ## Linux agent
 
-`agent/` はCPU、コア別使用率、I/O wait、メモリ、load average、ネットワークを返すLinux用TCPデーモンです。ネットワークは /proc/net/dev のカウンタ差分を前回要求からの経過秒で割り、インターフェース別に受信・送信bytes/s、packets/s、errors/s、drops/sを記録します。I/O waitはカーネルが公開する値のため目安として扱ってください。Linux向けReleaseアーカイブを展開してインストールします。
+`agent/` はCPU、コア別使用率、I/O wait、メモリ、load average、ネットワークを返すLinux用TCPデーモンです。ネットワークは /proc/net/dev のカウンタ差分を前回要求からの経過秒で割り、インターフェース別に受信・送信bytes/s、packets/s、errors/s、drops/sを記録します。I/O waitはカーネルが公開する値のため目安として扱ってください。ReleaseのLinuxアーカイブにはバイナリとinstallerが含まれます。単体の `.sh` はGitHub Releaseから最新バイナリを取得します。
 
 ```bash
+curl -fL https://github.com/371tti/status.371tti.net/releases/latest/download/wk-status-371tti-net-agent.sh -o install.sh
 sudo bash ./install.sh install
 sudo bash ./install.sh configure
 sudo bash ./install.sh uninstall
