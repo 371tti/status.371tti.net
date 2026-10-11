@@ -1,0 +1,23 @@
+[package]
+name = "wk-status-371tti-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+atomicwrites = "0.4"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "rustls-platform-verifier", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+kurosabi = { version = "0.6.20", default-features = false, features = ["tokio-server"] }
+minijinja = { version = "3", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+surge-ping = "0.9"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tower-service = "0.3"
+url = "2"

@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <h1>Status</h1>
+</section>
+
+<section class="overview-status {{ overall_status_class }}" aria-label="Overall status">
+  <div class="overview-status-primary">
+    <div>
+      <p class="eyebrow">Overall</p>
+      <strong>{{ overall_status_label }}</strong>
+    </div>
+  </div>
+  <div class="overview-service-count">
+    <span>Operational</span>
+    <strong><b class="text-up">{{ normal_count }}</b><small> / {{ status_total_count }}</small></strong>
+  </div>
+  <div class="overview-status-breakdown" aria-label="Service counts by status">
+    <div><span>Down</span><strong class="text-down">{{ down_count }}</strong></div>
+    <div><span>Degraded</span><strong class="text-slow">{{ slow_count }}</strong></div>
+    <div><span>Pending</span><strong>{{ pending_count }}</strong></div>
+  </div>
+</section>
+
+<section class="section-heading">
+  <div>
+    <h2>Services</h2>
+  </div>
+  <div class="updated-at dashboard-meta">
+    <span>Updated {{ generated_at }}</span>
+  </div>
+</section>
+
+{% if groups %}
+<div class="monitor-groups">
+  {% for group in groups %}
+  <section class="monitor-group">
+    <div class="monitor-group-heading">
+      <div class="monitor-group-identity">
+        <h2>{{ group.name }}</h2>
+      </div>
+      <span class="monitor-group-total">{{ group.total_count }} services</span>
+    </div>
+
+    {% if group.show_group_status %}
+    <div class="group-summary">
+      <section class="overview-status group-status {{ group.status_class }}" aria-label="{{ group.name }} status">
+        <div class="overview-status-primary">
+          <div>
+            <p class="eyebrow">Status</p>
+            <strong>{{ group.status_label }}</strong>
+          </div>
+        </div>
+        <div class="overview-service-count">
+          <span>Operational</span>
+          <strong><b class="text-up">{{ group.normal_count }}</b><small> / {{ group.status_total_count }}</small></strong>
+        </div>
+        <div class="overview-status-breakdown" aria-label="Service counts by status">
+          <div><span>Down</span><strong class="text-down">{{ group.down_count }}</strong></div>
+          <div><span>Degraded</span><strong class="text-slow">{{ group.slow_count }}</strong></div>
+          <div><span>Pending</span><strong>{{ group.pending_count }}</strong></div>
+        </div>
+      </section>
+
+      <div class="group-uptime">
+        <div class="group-uptime-heading">
+          <strong>Uptime</strong>
+        </div>
+        {% if group.uptime_bar %}
+        <div class="uptime-bar group-uptime-bar" role="group" aria-label="{{ group.uptime_bar_label }}">
+          {% for segment in group.uptime_bar %}<span class="uptime-segment {{ segment.status_class }}" title="{{ segment.title }}" tabindex="0" role="img" aria-label="{{ segment.title }}"></span>{% endfor %}
+        </div>
+        <div class="uptime-bar-axis" aria-hidden="true"><span>{{ group.uptime_bar_start_label }}</span><span>{{ group.uptime_bar_end_label }}</span></div>
+        {% else %}
+        <div class="group-uptime-empty">{{ group.uptime_bar_caption }}</div>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="monitor-list">
+      <div class="monitor-list-heading"><h3>Individual Services</h3></div>
+      {% for monitor in group.monitors %}
+      <article class="monitor-card" data-detail-href="/monitors/{{ monitor.id }}">
+        <div class="monitor-card-heading">
+          <div class="monitor-card-identity">
+            <h3><a class="monitor-link" href="/monitors/{{ monitor.id }}">{{ monitor.name }}</a></h3>
+            <span class="subtext">{{ monitor.id }}</span>
+            {% if monitor.exclude_from_aggregate_status %}<span class="subtext">Excluded</span>{% endif %}
+          </div>
+          <span class="status {{ monitor.status_class }} status-large">{{ monitor.status_label }}</span>
+        </div>
+
+        {% if monitor.uptime_bar %}
+        <div class="uptime-bar uptime-bar-overview" role="group" aria-label="{{ monitor.uptime_bar_label }}">
+          {% for segment in monitor.uptime_bar %}<span class="uptime-segment {{ segment.status_class }}" title="{{ segment.title }}" tabindex="0" role="img" aria-label="{{ segment.title }}"></span>{% endfor %}
+        </div>
+        <div class="uptime-bar-axis" aria-hidden="true"><span>{{ monitor.uptime_bar_start_label }}</span><span>{{ monitor.uptime_bar_end_label }}</span></div>
+        {% else %}
+        <div class="uptime-bar-empty">No checks yet.</div>
+        {% endif %}
+
+        <div class="monitor-card-footer">
+          <div class="monitor-card-uptime">
+            <span>{{ monitor.normal_label }}</span>
+            <strong>{{ monitor.normal_percent }}</strong>
+          </div>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% else %}
+<section class="empty-state">
+  <h2>No services configured</h2>
+</section>
+{% endif %}
+{% endblock %}

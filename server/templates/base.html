@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>{{ page_title }} · {{ app_name }}</title>
+  <style>{% include "style.css" %}</style>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">{{ app_name }}</a>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <div id="point-tooltip" class="point-tooltip" role="tooltip" hidden></div>
+  <script>
+    (() => {
+      const tooltip = document.getElementById("point-tooltip");
+      const selector = "[data-tooltip], [title]";
+      let activeTarget = null;
+      let pinned = false;
+
+      document.querySelectorAll("[title]").forEach((element) => {
+        if (!element.hasAttribute("data-tooltip")) {
+          element.dataset.tooltip = element.getAttribute("title") || "";
+        }
+        element.removeAttribute("title");
+      });
+
+      const targetFromEvent = (event) => {
+        if (!(event.target instanceof Element)) return null;
+        const target = event.target.closest(selector);
+        if (target) return target;
+
+        const bar = event.target.closest(".uptime-bar");
+        if (!bar) return null;
+        const segments = bar.querySelectorAll(".uptime-segment");
+        const bounds = bar.getBoundingClientRect();
+        if (!segments.length || bounds.width <= 0) return null;
+        const position = Math.max(0, Math.min(0.999999, (event.clientX - bounds.left) / bounds.width));
+        return segments[Math.floor(position * segments.length)];
+      };
+
+      const hideTooltip = () => {
+        if (activeTarget) activeTarget.removeAttribute("aria-describedby");
+        tooltip.hidden = true;
+        tooltip.replaceChildren();
+        tooltip.classList.remove("metric-tooltip");
+        activeTarget = null;
+        pinned = false;
+      };
+
+      const positionTooltip = (x, y) => {
+        const gap = 12;
+        const bounds = tooltip.getBoundingClientRect();
+        let left = x + gap;
+        let top = y - bounds.height - gap;
+        if (top < 8) top = y + gap;
+        left = Math.max(8, Math.min(left, window.innerWidth - bounds.width - 8));
+        top = Math.max(8, Math.min(top, window.innerHeight - bounds.height - 8));
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${top}px`;
+      };
+
+      const showTooltip = (target, x, y) => {
+        const message = target.dataset.tooltip || target.getAttribute("title");
+        if (!message) return;
+        if (activeTarget !== target && activeTarget) {
+          activeTarget.removeAttribute("aria-describedby");
+        }
+        activeTarget = target;
+        target.setAttribute("aria-describedby", "point-tooltip");
+        tooltip.classList.remove("metric-tooltip");
+        tooltip.textContent = message;
+        tooltip.hidden = false;
+        positionTooltip(x, y);
+      };
+
+      const showMetricTooltip = (points, target, x, y) => {
+        if (!points.length || !target) return;
+        if (activeTarget && activeTarget !== target) {
+          activeTarget.removeAttribute("aria-describedby");
+        }
+        activeTarget = target;
+        target.setAttribute("aria-describedby", "point-tooltip");
+        pinned = false;
+        tooltip.classList.add("metric-tooltip");
+        tooltip.replaceChildren();
+
+        const time = document.createElement("div");
+        time.className = "metric-tooltip-time";
+        time.textContent = target.dataset.checkedAt || "";
+        tooltip.append(time);
+
+        const values = document.createElement("div");
+        values.className = "metric-tooltip-values";
+        points.forEach((point) => {
+          const row = document.createElement("div");
+          row.className = `metric-tooltip-row metric-series-${point.dataset.colorIndex}`;
+          const key = document.createElement("span");
+          key.className = "metric-tooltip-key";
+          key.textContent = point.dataset.key || "";
+          const value = document.createElement("strong");
+          value.className = "metric-tooltip-value";
+          value.textContent = point.dataset.value || "—";
+          row.append(key, value);
+          values.append(row);
+        });
+        tooltip.append(values);
+        tooltip.hidden = false;
+        positionTooltip(x, y);
+      };
+
+      const hideMetricTooltip = () => {
+        if (!tooltip.classList.contains("metric-tooltip")) return;
+        if (activeTarget) activeTarget.removeAttribute("aria-describedby");
+        tooltip.hidden = true;
+        tooltip.replaceChildren();
+        tooltip.classList.remove("metric-tooltip");
+        activeTarget = null;
+        pinned = false;
+      };
+
+      document.addEventListener("pointerover", (event) => {
+        if (event.pointerType === "touch") return;
+        const target = targetFromEvent(event);
+        if (target) showTooltip(target, event.clientX, event.clientY);
+      });
+
+      document.addEventListener("pointermove", (event) => {
+        if (event.pointerType === "touch" || pinned || !activeTarget) return;
+        positionTooltip(event.clientX, event.clientY);
+      });
+
+      document.addEventListener("pointerout", (event) => {
+        if (event.pointerType === "touch" || pinned) return;
+        const target = targetFromEvent(event);
+        if (target && target === activeTarget && !target.contains(event.relatedTarget)) {
+          hideTooltip();
+        }
+      });
+
+      document.addEventListener("focusin", (event) => {
+        const target = targetFromEvent(event);
+        if (!target) return;
+        const bounds = target.getBoundingClientRect();
+        showTooltip(target, bounds.left + bounds.width / 2, bounds.top);
+      });
+
+      document.addEventListener("focusout", (event) => {
+        const target = targetFromEvent(event);
+        if (target && target === activeTarget && !pinned) hideTooltip();
+      });
+
+      document.addEventListener("click", (event) => {
+        const target = targetFromEvent(event);
+        if (target) {
+          pinned = true;
+          const bounds = target.getBoundingClientRect();
+          showTooltip(target, bounds.left + bounds.width / 2, bounds.top);
+        } else if (activeTarget) {
+          hideTooltip();
+        }
+      });
+
+      document.querySelectorAll(".monitor-card[data-detail-href]").forEach((card) => {
+        card.addEventListener("click", (event) => {
+          const clickedElement = event.target instanceof Element ? event.target : null;
+          if (event.defaultPrevented || clickedElement?.closest("a, button, input, select, textarea, summary")) return;
+          if (event.button !== 0 || window.getSelection()?.toString()) return;
+          window.location.assign(card.dataset.detailHref);
+        });
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") hideTooltip();
+      });
+
+      document.addEventListener("scroll", () => {
+        if (activeTarget) hideTooltip();
+      }, true);
+
+      const timingPanel = document.querySelector("[data-http-phase-timings]");
+      if (timingPanel) {
+        const phaseNames = [
+          ["dns", "dns"],
+          ["tcp_connect", "tcpConnect"],
+          ["tls_handshake", "tlsHandshake"],
+          ["request_to_headers", "requestToHeaders"],
+          ["total", "total"],
+        ];
+        const selectedAt = timingPanel.querySelector("[data-http-timing-selected-at]");
+        const timingPoints = document.querySelectorAll("[data-http-timing-point]");
+        const chartSvg = timingPanel.closest(".response-time-panel")?.querySelector(".response-chart");
+        const chartScroll = chartSvg?.closest(".response-chart-scroll");
+        const hoverLine = chartSvg?.querySelector("[data-chart-hover-line]");
+        let selectedTimingPoint = null;
+        const selectTimingPoint = (point) => {
+          if (selectedTimingPoint === point) return;
+          selectedTimingPoint = point;
+          if (selectedAt) selectedAt.textContent = point.dataset.checkedAt || "—";
+          phaseNames.forEach(([name, datasetName]) => {
+            const value = timingPanel.querySelector(`[data-http-phase-value="${name}"]`);
+            if (value) value.textContent = point.dataset[datasetName] || "—";
+          });
+          timingPoints.forEach((candidate) => candidate.setAttribute("aria-pressed", String(candidate === point)));
+          if (hoverLine) {
+            const x = point.dataset.chartX || point.getAttribute("cx");
+            hoverLine.setAttribute("x1", x);
+            hoverLine.setAttribute("x2", x);
+            hoverLine.classList.add("is-visible");
+          }
+        };
+        timingPoints.forEach((point) => {
+          point.addEventListener("click", () => selectTimingPoint(point));
+          point.addEventListener("focus", () => selectTimingPoint(point));
+          point.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            point.click();
+          });
+        });
+        const selectTimingPointAt = (clientX) => {
+          if (!chartSvg) return;
+          const bounds = chartSvg.getBoundingClientRect();
+          if (bounds.width <= 0 || clientX < bounds.left || clientX > bounds.right) return;
+          const viewBoxWidth = chartSvg.viewBox.baseVal.width || bounds.width;
+          const x = (clientX - bounds.left) * (viewBoxWidth / bounds.width);
+          let nearestPoint = null;
+          let nearestDistance = Number.POSITIVE_INFINITY;
+          timingPoints.forEach((point) => {
+            const pointX = Number(point.dataset.chartX || point.getAttribute("cx"));
+            const distance = Math.abs(pointX - x);
+            if (distance < nearestDistance) {
+              nearestPoint = point;
+              nearestDistance = distance;
+            }
+          });
+          if (nearestPoint) selectTimingPoint(nearestPoint);
+        };
+        chartScroll?.addEventListener("pointermove", (event) => {
+          if (event.pointerType !== "touch") selectTimingPointAt(event.clientX);
+        });
+        chartScroll?.addEventListener("click", (event) => {
+          if (event.detail !== 0) selectTimingPointAt(event.clientX);
+        });
+      }
+
+      const formatChartTime = (timestamp) => {
+        const date = new Date(timestamp);
+        const pad = (value) => String(value).padStart(2, "0");
+        return `${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+      };
+
+      const updateChartAxis = (shell) => {
+        const scroll = shell.querySelector(".response-chart-scroll");
+        const startLabel = shell.querySelector("[data-chart-visible-start]");
+        const endLabel = shell.querySelector("[data-chart-visible-end]");
+        if (!scroll || !startLabel || !endLabel) return;
+
+        const start = Number(shell.dataset.chartStartMs);
+        const end = Number(shell.dataset.chartEndMs);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+        const span = Math.max(0, end - start);
+        const plotRange = Math.max(1, scroll.scrollWidth - 16);
+        const fractionAt = (position) => Math.max(0, Math.min(1, (position - 8) / plotRange));
+        const visibleStart = fractionAt(scroll.scrollLeft);
+        const visibleEnd = fractionAt(scroll.scrollLeft + scroll.clientWidth);
+        startLabel.textContent = formatChartTime(start + span * visibleStart);
+        endLabel.textContent = formatChartTime(start + span * visibleEnd);
+      };
+
+      const updateMetricChartAxis = (shell) => {
+        const scroll = shell.querySelector(".metric-chart-scroll");
+        const startLabel = shell.querySelector("[data-metric-visible-start]");
+        const endLabel = shell.querySelector("[data-metric-visible-end]");
+        if (!scroll || !startLabel || !endLabel) return;
+
+        const start = Number(shell.dataset.metricStartMs);
+        const end = Number(shell.dataset.metricEndMs);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+        const span = Math.max(0, end - start);
+        const plotRange = Math.max(1, scroll.scrollWidth - 16);
+        const fractionAt = (position) => Math.max(0, Math.min(1, (position - 8) / plotRange));
+        const visibleStart = fractionAt(scroll.scrollLeft);
+        const visibleEnd = fractionAt(scroll.scrollLeft + scroll.clientWidth);
+        startLabel.textContent = formatChartTime(start + span * visibleStart);
+        endLabel.textContent = formatChartTime(start + span * visibleEnd);
+      };
+
+      const chartShells = document.querySelectorAll(".response-chart-shell");
+      chartShells.forEach((shell) => {
+        shell.querySelector(".response-chart-scroll")?.addEventListener("scroll", () => {
+          updateChartAxis(shell);
+        }, { passive: true });
+      });
+      const metricChartShells = document.querySelectorAll(".metric-chart-shell");
+      metricChartShells.forEach((shell) => {
+        const scroll = shell.querySelector(".metric-chart-scroll");
+        const chartSvg = shell.querySelector(".metric-chart");
+        const hoverLine = chartSvg?.querySelector("[data-metric-hover-line]");
+        const pointHits = chartSvg ? [...chartSvg.querySelectorAll(".metric-chart-point-hit")] : [];
+        let lastPointerX = null;
+        let lastPointerY = null;
+
+        const setHoverLineX = (x) => {
+          if (!hoverLine || !Number.isFinite(x)) return;
+          hoverLine.setAttribute("x1", String(x));
+          hoverLine.setAttribute("x2", String(x));
+          hoverLine.classList.add("is-visible");
+        };
+        const updateMetricHover = (clientX, clientY) => {
+          if (!chartSvg || !scroll || !hoverLine) return;
+          const bounds = chartSvg.getBoundingClientRect();
+          const scrollBounds = scroll.getBoundingClientRect();
+          if (bounds.width <= 0 || clientX < scrollBounds.left || clientX > scrollBounds.right) return;
+          const viewBoxWidth = chartSvg.viewBox.baseVal.width || bounds.width;
+          const x = (clientX - bounds.left) * (viewBoxWidth / bounds.width);
+          let nearestPoint = null;
+          let nearestDistance = Number.POSITIVE_INFINITY;
+          pointHits.forEach((point) => {
+            const pointX = Number(point.getAttribute("cx"));
+            const distance = Math.abs(pointX - x);
+            if (distance < nearestDistance) {
+              nearestPoint = point;
+              nearestDistance = distance;
+            }
+          });
+          if (!nearestPoint) {
+            hideHoverLine();
+            hideMetricTooltip();
+            return;
+          }
+          const nearestX = Number(nearestPoint.getAttribute("cx"));
+          const timestamp = nearestPoint.dataset.timestampMs;
+          const pointsAtTime = pointHits.filter((point) => point.dataset.timestampMs === timestamp);
+          setHoverLineX(nearestX);
+          showMetricTooltip(pointsAtTime, nearestPoint, clientX, clientY);
+        };
+        const hideHoverLine = () => hoverLine?.classList.remove("is-visible");
+
+        scroll?.addEventListener("scroll", () => {
+          updateMetricChartAxis(shell);
+          if (lastPointerX !== null && lastPointerY !== null) {
+            updateMetricHover(lastPointerX, lastPointerY);
+          }
+        }, { passive: true });
+        scroll?.addEventListener("pointermove", (event) => {
+          if (event.pointerType === "touch") return;
+          lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
+          updateMetricHover(lastPointerX, lastPointerY);
+        });
+        scroll?.addEventListener("pointerleave", () => {
+          lastPointerX = null;
+          lastPointerY = null;
+          if (!scroll.contains(document.activeElement)) {
+            hideHoverLine();
+            hideMetricTooltip();
+          }
+        });
+        pointHits.forEach((point) => {
+          point.addEventListener("focus", () => {
+            const timestamp = point.dataset.timestampMs;
+            const pointsAtTime = pointHits.filter((item) => item.dataset.timestampMs === timestamp);
+            const bounds = point.getBoundingClientRect();
+            setHoverLineX(Number(point.getAttribute("cx")));
+            showMetricTooltip(
+              pointsAtTime,
+              point,
+              bounds.left + bounds.width / 2,
+              bounds.top
+            );
+          });
+          point.addEventListener("blur", () => {
+            if (!scroll?.matches(":hover")) {
+              hideHoverLine();
+              hideMetricTooltip();
+            }
+          });
+        });
+      });
+
+      const scrollToLatest = () => {
+        document.querySelectorAll("[data-scroll-latest]").forEach((element) => {
+          element.scrollLeft = element.scrollWidth;
+        });
+        document.querySelectorAll(".metric-chart-scroll").forEach((element) => {
+          element.scrollLeft = element.scrollWidth;
+        });
+        chartShells.forEach(updateChartAxis);
+        metricChartShells.forEach(updateMetricChartAxis);
+      };
+      window.addEventListener("resize", () => {
+        chartShells.forEach(updateChartAxis);
+        metricChartShells.forEach(updateMetricChartAxis);
+      });
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", scrollToLatest, { once: true });
+      } else {
+        scrollToLatest();
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+[package]
+name = "wk-status-371tti-net-agent"
+version.workspace = true
+edition.workspace = true

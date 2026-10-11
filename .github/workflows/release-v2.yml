@@ -1,0 +1,187 @@
+name: Release (v2)
+
+on:
+  push:
+    branches: ["v2"]
+
+concurrency:
+  group: release-v2
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: wk-status-371tti-net
+
+jobs:
+  plan:
+    name: Decide version/tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "wk-status-371tti-net") | .version')"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          tag="${{ steps.ver.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "Tag $tag already exists -> skip release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $tag does not exist -> will release"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build release binaries
+    needs: plan
+    if: needs.plan.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            artifact_name: wk-status-371tti-net-linux-x86_64
+            package_name: wk-status-371tti-net
+            bin_name: wk-status-371tti-net
+            bin_ext: ""
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            artifact_name: wk-status-371tti-net-windows-x86_64
+            package_name: wk-status-371tti-net
+            bin_name: wk-status-371tti-net
+            bin_ext: ".exe"
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            artifact_name: wk-status-371tti-net-agent-linux-x86_64
+            package_name: wk-status-371tti-net-agent
+            bin_name: wk-status-371tti-net-agent
+            bin_ext: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.rust_target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.rust_target }}-cargo-
+
+      - name: Build (release)
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo build --release --package "${{ matrix.package_name }}" --target "${{ matrix.rust_target }}"
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="target/${{ matrix.rust_target }}/release/${{ matrix.bin_name }}${{ matrix.bin_ext }}"
+          mkdir -p dist
+          cp "$SRC" "dist/${{ matrix.bin_name }}${{ matrix.bin_ext }}"
+
+      - name: Package agent installer
+        if: matrix.package_name == 'wk-status-371tti-net-agent'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          cp "dist/${{ matrix.bin_name }}" "$staging/${{ matrix.bin_name }}"
+          cp agent/scripts/wk-status-371tti-net-agent.sh "$staging/install.sh"
+          tar -C "$staging" -czf "dist/${{ matrix.bin_name }}-linux-x86_64.tar.gz" .
+          cp agent/scripts/wk-status-371tti-net-agent.sh "dist/${{ matrix.bin_name }}.sh"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create tag + GitHub Release
+    needs: [plan, build]
+    if: needs.plan.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.plan.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "$tag"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: ${{ needs.plan.outputs.tag }}
+          generate_release_notes: true
+          files: release-assets/*
