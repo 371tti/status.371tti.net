@@ -119,7 +119,7 @@
   <h2>Metrics</h2>
   {% for group in metric_groups %}
   <div class="metric-group">
-    <h3>{{ group.name }}{% if group.unit %}<span class="metric-group-unit">{{ group.unit }}</span>{% endif %}</h3>
+    <h3><span class="metric-group-name">{{ group.name }}</span>{% if group.unit %}<span class="metric-group-unit">{{ group.unit }}</span>{% endif %}</h3>
     {% for chart in group.charts %}
     <article class="metric-chart-card">
       <div class="metric-chart-legend" role="list" aria-label="Metrics in {{ group.name }}">

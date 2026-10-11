@@ -276,8 +276,9 @@ pre { max-height: 460px; overflow: auto; margin: 12px 0 0; padding: 14px; border
 .response-chart-empty { display: grid; min-height: 180px; place-items: center; border: 1px dashed var(--line); color: var(--muted); }
 .metric-panel > h2 { margin-bottom: 18px; }
 .metric-group { min-width: 0; margin-top: 18px; border-top: 1px solid var(--line); }
-.metric-group h3 { margin: 14px 0 8px; font-size: 1rem; overflow-wrap: anywhere; }
-.metric-group-unit { margin-left: 8px; color: var(--muted); font-size: 0.82em; font-weight: 400; }
+.metric-group h3 { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 14px 0 8px; font-size: 1rem; }
+.metric-group-name { min-width: 0; overflow-wrap: anywhere; }
+.metric-group-unit { flex: 0 0 auto; margin-left: auto; color: var(--muted); font-size: 0.82em; font-weight: 400; white-space: nowrap; }
 .metric-chart-card { min-width: 0; padding: 12px 0 16px; border-top: 1px solid var(--line); }
 .metric-chart-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 8px; color: var(--muted); font-size: 0.78rem; }
 .metric-chart-legend-item { display: inline-flex; min-width: 0; align-items: center; gap: 6px; overflow-wrap: anywhere; }
