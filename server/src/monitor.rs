@@ -8,6 +8,7 @@ use chrono::Utc;
 use http::Method;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
+use tracing::{debug, error, info};
 
 use crate::{
     config::{AppConfig, MonitorConfig, MonitorTarget, ResponseCodeStatus},
@@ -50,23 +51,102 @@ struct TargetResult {
     tcp_response_truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+enum TcpProbeFailure {
+    DnsLookup,
+    NoAddresses,
+    Connect,
+    Send,
+    Read,
+    ResponseTerminator,
+}
+
+impl TcpProbeFailure {
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::DnsLookup => "TCP DNS lookup failed",
+            Self::NoAddresses => "TCP DNS lookup returned no addresses",
+            Self::Connect => "TCP connection failed",
+            Self::Send => "TCP message send failed",
+            Self::Read => "TCP response read failed",
+            Self::ResponseTerminator => "TCP response ended before response_end",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PingProbeFailure {
+    DnsLookup,
+    NoAddresses,
+    IcmpEcho,
+}
+
+impl PingProbeFailure {
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::DnsLookup => "Ping DNS lookup failed",
+            Self::NoAddresses => "Ping DNS lookup returned no addresses",
+            Self::IcmpEcho => "ICMP echo failed",
+        }
+    }
+}
+
 pub fn start_tasks(config: &AppConfig, store: Store) {
     for monitor in config.monitors.iter().cloned() {
+        let monitor_type = match &monitor.target {
+            MonitorTarget::Http { .. } => "http",
+            MonitorTarget::Ping { .. } => "ping",
+            MonitorTarget::Tcp { .. } => "tcp",
+        };
+        info!(
+            monitor_id = %monitor.id,
+            monitor_type,
+            interval_seconds = monitor.interval_seconds,
+            timeout_seconds = monitor.timeout_seconds,
+            slow_ms = ?monitor.slow_response_threshold_ms,
+            excluded_from_status = monitor.exclude_from_aggregate_status,
+            "monitor scheduled"
+        );
         let monitor_store = store.clone();
         tokio::spawn(async move {
             let http_probe_client = matches!(&monitor.target, MonitorTarget::Http { .. })
                 .then(http_probe::build_client);
             if let Some(Err(error)) = &http_probe_client {
-                eprintln!(
-                    "failed to initialize HTTP probe for {}: {error}",
-                    monitor.id
+                error!(
+                    monitor_id = %monitor.id,
+                    error = %error,
+                    "failed to initialize HTTP probe"
                 );
             }
             loop {
                 sleep(delay_until_next_check(monitor.interval_seconds)).await;
+                debug!(monitor_id = %monitor.id, "monitor check started");
                 let result = run_check(&monitor, http_probe_client.as_ref()).await;
+                let status = if result.is_degraded {
+                    "degraded"
+                } else if result.is_up {
+                    "operational"
+                } else {
+                    "down"
+                };
+                info!(
+                    monitor_id = %result.monitor_id,
+                    status,
+                    checked_at_ms = result.checked_at_ms,
+                    latency_ms = ?result.latency_ms,
+                    http_status = ?result.status_code,
+                    service_status_code = ?result.service_status_code,
+                    http_timings = ?result.http_timings,
+                    metric_count = result.metrics.len(),
+                    message = %result.message,
+                    "monitor check completed"
+                );
                 if let Err(error) = monitor_store.insert_check(&result).await {
-                    eprintln!("failed to save check for {}: {error}", monitor.id);
+                    error!(
+                        monitor_id = %monitor.id,
+                        error = %error,
+                        "failed to save monitor check"
+                    );
                 }
             }
         });
@@ -78,8 +158,9 @@ pub fn start_tasks(config: &AppConfig, store: Store) {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
-            if let Err(error) = retention_store.delete_expired().await {
-                eprintln!("failed to clean old checks: {error}");
+            match retention_store.delete_expired().await {
+                Ok(()) => info!("history retention cleanup completed"),
+                Err(error) => error!(error = %error, "failed to clean expired history"),
             }
         }
     });
@@ -304,13 +385,13 @@ async fn check_target(
                 Method::from_bytes(method.to_ascii_uppercase().as_bytes()).unwrap_or(Method::GET);
             let http_client = match http_probe_client {
                 Some(Ok(client)) => client,
-                Some(Err(error)) => {
+                Some(Err(_)) => {
                     return TargetResult {
                         is_up: false,
                         latency_ms: None,
                         http_timings: None,
                         status_code: None,
-                        message: format!("HTTP request failed: {error}"),
+                        message: "HTTP probe could not be initialized".to_owned(),
                         ..TargetResult::default()
                     };
                 }
@@ -335,7 +416,11 @@ async fn check_target(
                     latency_ms: None,
                     http_timings: Some(http_client.finish_timings()),
                     status_code: None,
-                    message: format!("HTTP request failed: {error}"),
+                    message: if error.contains("timed out") {
+                        "HTTP request timed out".to_owned()
+                    } else {
+                        "HTTP request failed".to_owned()
+                    },
                     ..TargetResult::default()
                 },
                 Ok(response) => {
@@ -368,14 +453,12 @@ async fn check_target(
             let operation = async {
                 let mut addresses = tokio::net::lookup_host((host.as_str(), 0))
                     .await
-                    .map_err(|error| format!("DNS lookup failed: {error}"))?;
-                let address: SocketAddr = addresses
-                    .next()
-                    .ok_or_else(|| "DNS lookup returned no addresses".to_owned())?;
+                    .map_err(|_| PingProbeFailure::DnsLookup)?;
+                let address: SocketAddr = addresses.next().ok_or(PingProbeFailure::NoAddresses)?;
                 let (_packet, duration) = surge_ping::ping(address.ip(), &[0; 8])
                     .await
-                    .map_err(|error| format!("ICMP echo failed: {error}"))?;
-                Ok::<_, String>((address, duration))
+                    .map_err(|_| PingProbeFailure::IcmpEcho)?;
+                Ok::<_, PingProbeFailure>(duration)
             };
             match timeout(timeout_duration, operation).await {
                 Err(_) => TargetResult {
@@ -391,18 +474,17 @@ async fn check_target(
                     latency_ms: None,
                     http_timings: None,
                     status_code: None,
-                    message: error,
+                    message: error.public_message().to_owned(),
                     ..TargetResult::default()
                 },
-                Ok(Ok((address, duration))) => TargetResult {
+                Ok(Ok(duration)) => TargetResult {
                     is_up: true,
                     response_received: true,
                     latency_ms: Some(duration.as_secs_f64() * 1000.0),
                     http_timings: None,
                     status_code: None,
                     message: format!(
-                        "ICMP reply from {} ({:.2} ms)",
-                        address.ip(),
+                        "ICMP reply received ({:.2} ms)",
                         duration.as_secs_f64() * 1000.0
                     ),
                     ..TargetResult::default()
@@ -416,7 +498,6 @@ async fn check_target(
             response_terminator,
             max_response_bytes,
         } => {
-            let target = format_tcp_target(host, *port);
             let started = Instant::now();
             let mut connected = false;
             let mut response_bytes = Vec::new();
@@ -424,22 +505,23 @@ async fn check_target(
             let operation = async {
                 let addresses = tokio::net::lookup_host((host.as_str(), *port))
                     .await
-                    .map_err(|error| format!("TCP DNS lookup failed: {error}"))?;
-                let mut last_error = None;
+                    .map_err(|_| TcpProbeFailure::DnsLookup)?;
                 let mut stream = None;
+                let mut found_address = false;
                 for address in addresses {
+                    found_address = true;
                     match tokio::net::TcpStream::connect(address).await {
                         Ok(connected_stream) => {
                             stream = Some(connected_stream);
                             break;
                         }
-                        Err(error) => last_error = Some(error),
+                        Err(_) => {}
                     }
                 }
-                let mut stream = stream.ok_or_else(|| {
-                    last_error
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "DNS lookup returned no addresses".to_owned())
+                let mut stream = stream.ok_or(if found_address {
+                    TcpProbeFailure::Connect
+                } else {
+                    TcpProbeFailure::NoAddresses
                 })?;
                 connected = true;
 
@@ -447,7 +529,7 @@ async fn check_target(
                     stream
                         .write_all(message.as_bytes())
                         .await
-                        .map_err(|error| format!("TCP message send failed: {error}"))?;
+                        .map_err(|_| TcpProbeFailure::Send)?;
                     response_truncated = read_tcp_response(
                         &mut stream,
                         response_terminator.as_deref(),
@@ -458,13 +540,11 @@ async fn check_target(
                     if let Some(terminator) = response_terminator
                         && !response_bytes.ends_with(terminator.as_bytes())
                     {
-                        return Err(
-                            "TCP response ended before the configured response_end".to_owned()
-                        );
+                        return Err(TcpProbeFailure::ResponseTerminator);
                     }
                 }
 
-                Ok::<(), String>(())
+                Ok::<(), TcpProbeFailure>(())
             };
             match timeout(timeout_duration, operation).await {
                 Err(_) => TargetResult {
@@ -475,13 +555,10 @@ async fn check_target(
                     status_code: None,
                     telemetry: (!response_bytes.is_empty()).then(|| response_bytes.clone()),
                     message: if send_message.is_some() {
-                        format!(
-                            "TCP exchange with {target} timed out after {}s",
-                            monitor.timeout_seconds
-                        )
+                        format!("TCP exchange timed out after {}s", monitor.timeout_seconds)
                     } else {
                         format!(
-                            "TCP connection to {target} timed out after {}s",
+                            "TCP connection timed out after {}s",
                             monitor.timeout_seconds
                         )
                     },
@@ -496,11 +573,7 @@ async fn check_target(
                     http_timings: None,
                     status_code: None,
                     telemetry: (!response_bytes.is_empty()).then(|| response_bytes.clone()),
-                    message: if send_message.is_some() {
-                        format!("TCP exchange with {target} failed: {error}")
-                    } else {
-                        format!("TCP connection to {target} failed: {error}")
-                    },
+                    message: error.public_message().to_owned(),
                     tcp_response: (!response_bytes.is_empty()).then(|| response_bytes.clone()),
                     tcp_response_truncated: response_truncated
                         || (connected && !response_bytes.is_empty()),
@@ -510,13 +583,13 @@ async fn check_target(
                     let message = if send_message.is_some() {
                         if response_truncated {
                             format!(
-                                "TCP exchange with {target} succeeded; response capture was truncated at {max_response_bytes} bytes"
+                                "TCP exchange succeeded; response capture was truncated at {max_response_bytes} bytes"
                             )
                         } else {
-                            format!("TCP exchange with {target} succeeded")
+                            "TCP exchange succeeded".to_owned()
                         }
                     } else {
-                        format!("TCP connection to {target} succeeded")
+                        "TCP connection succeeded".to_owned()
                     };
                     TargetResult {
                         is_up: true,
@@ -540,7 +613,7 @@ async fn read_tcp_response(
     terminator: Option<&str>,
     max_response_bytes: usize,
     response: &mut Vec<u8>,
-) -> Result<bool, String> {
+) -> Result<bool, TcpProbeFailure> {
     let mut buffer = [0; 1024];
     loop {
         let remaining = max_response_bytes.saturating_sub(response.len());
@@ -551,7 +624,7 @@ async fn read_tcp_response(
         let count = stream
             .read(&mut buffer[..read_len])
             .await
-            .map_err(|error| format!("TCP response read failed: {error}"))?;
+            .map_err(|_| TcpProbeFailure::Read)?;
         if count == 0 {
             return Ok(false);
         }
@@ -568,13 +641,5 @@ async fn read_tcp_response(
                 return Ok(false);
             }
         }
-    }
-}
-
-fn format_tcp_target(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
     }
 }

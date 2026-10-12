@@ -165,7 +165,7 @@ pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
     let mut keys = BTreeSet::new();
     for record in history {
         for key in record.metrics.keys() {
-            keys.insert(key.clone());
+            keys.insert(canonical_metric_key(key));
             if keys.len() == MAX_METRIC_CHARTS {
                 break;
             }
@@ -186,7 +186,24 @@ pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
     }
 
     let mut groups = BTreeMap::<String, Vec<MetricChartView>>::new();
-    for (name, keys) in grouped_keys {
+    for (name, mut keys) in grouped_keys {
+        keys.sort_by(|left, right| {
+            let left_label = left.rsplit('.').next().unwrap_or(left);
+            let right_label = right.rsplit('.').next().unwrap_or(right);
+            match (left_label, right_label) {
+                ("all", "all") => std::cmp::Ordering::Equal,
+                ("all", _) => std::cmp::Ordering::Less,
+                (_, "all") => std::cmp::Ordering::Greater,
+                _ => match (left_label.parse::<usize>(), right_label.parse::<usize>()) {
+                    (Ok(left_index), Ok(right_index)) => left_index
+                        .cmp(&right_index)
+                        .then_with(|| left_label.cmp(right_label)),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => left_label.cmp(right_label),
+                },
+            }
+        });
         let unit = latest_metric_unit(&name, history);
         if let Some(chart) = metric_chart(&name, &keys, history, &unit) {
             groups.entry(name).or_default().push(chart);
@@ -212,10 +229,12 @@ fn latest_metric_unit(group: &str, history: &[CheckRecord]) -> String {
     history
         .iter()
         .filter_map(|record| {
-            record
-                .metric_units
-                .get(group)
-                .map(|unit| (record.checked_at_ms, unit))
+            record.metric_units.iter().find_map(|(raw_group, unit)| {
+                canonical_metric_unit_groups(raw_group)
+                    .iter()
+                    .any(|canonical| canonical == group)
+                    .then_some((record.checked_at_ms, unit))
+            })
         })
         .max_by_key(|(checked_at_ms, _)| *checked_at_ms)
         .map(|(_, unit)| unit.clone())
@@ -235,12 +254,9 @@ fn metric_chart(
         .iter()
         .map(String::as_str)
         .filter(|key| {
-            chronological.iter().any(|record| {
-                record
-                    .metrics
-                    .get(*key)
-                    .is_some_and(|value| value.is_finite())
-            })
+            chronological
+                .iter()
+                .any(|record| metric_value(record, key).is_some_and(|value| value.is_finite()))
         })
         .collect();
     if metric_keys.is_empty() {
@@ -251,7 +267,7 @@ fn metric_chart(
     let mut maximum = f64::NEG_INFINITY;
     for key in &metric_keys {
         for record in &chronological {
-            if let Some(value) = record.metrics.get(*key).filter(|value| value.is_finite()) {
+            if let Some(value) = metric_value(record, key).filter(|value| value.is_finite()) {
                 minimum = minimum.min(*value);
                 maximum = maximum.max(*value);
             }
@@ -297,7 +313,7 @@ fn metric_chart(
         let mut line_paths = Vec::new();
         let mut current_path = String::new();
         for record in &chronological {
-            let Some(value) = record.metrics.get(key).filter(|value| value.is_finite()) else {
+            let Some(value) = metric_value(record, key).filter(|value| value.is_finite()) else {
                 if !current_path.is_empty() {
                     line_paths.push(MetricChartLine {
                         path_data: std::mem::take(&mut current_path),
@@ -340,6 +356,7 @@ fn metric_chart(
         }
         series.push(MetricChartSeries {
             key: key.to_owned(),
+            label: key.rsplit('.').next().unwrap_or(key).to_owned(),
             color_index,
             line_paths,
             points,
@@ -363,6 +380,67 @@ fn metric_chart(
         ticks,
         series,
     })
+}
+
+fn canonical_metric_key(key: &str) -> String {
+    match key {
+        "cpu.percent.usage" => return "cpu.core.percent.all".to_owned(),
+        "cpu.percent.iowait" => return "cpu.core.iowait.all".to_owned(),
+        _ => {}
+    }
+    if let Some(rest) = key.strip_prefix("cpu.core.") {
+        if let Some((core, metric)) = rest.split_once(".percent.") {
+            if core.bytes().all(|byte| byte.is_ascii_digit()) {
+                return match metric {
+                    "usage" => format!("cpu.core.percent.{core}"),
+                    "iowait" => format!("cpu.core.iowait.{core}"),
+                    _ => key.to_owned(),
+                };
+            }
+        }
+    }
+    let parts = key.split('.').collect::<Vec<_>>();
+    if parts.len() == 4
+        && parts[0] == "network"
+        && matches!(parts[2], "bytes" | "packets" | "errors" | "drops")
+        && matches!(parts[3], "rx" | "tx")
+    {
+        return format!("network.{}.{}.{}", parts[2], parts[3], parts[1]);
+    }
+    key.to_owned()
+}
+
+fn metric_value<'a>(record: &'a CheckRecord, canonical_key: &str) -> Option<&'a f64> {
+    record.metrics.get(canonical_key).or_else(|| {
+        record
+            .metrics
+            .iter()
+            .find_map(|(key, value)| (canonical_metric_key(key) == canonical_key).then_some(value))
+    })
+}
+
+fn canonical_metric_unit_groups(group: &str) -> Vec<String> {
+    if group == "cpu.percent" {
+        return vec!["cpu.core.percent".to_owned(), "cpu.core.iowait".to_owned()];
+    }
+    if let Some(rest) = group.strip_prefix("cpu.core.") {
+        if let Some((core, "percent")) = rest.split_once('.') {
+            if core.bytes().all(|byte| byte.is_ascii_digit()) {
+                return vec!["cpu.core.percent".to_owned(), "cpu.core.iowait".to_owned()];
+            }
+        }
+    }
+    let parts = group.split('.').collect::<Vec<_>>();
+    if parts.len() == 3
+        && parts[0] == "network"
+        && matches!(parts[2], "bytes" | "packets" | "errors" | "drops")
+    {
+        return vec![
+            format!("network.{}.rx", parts[2]),
+            format!("network.{}.tx", parts[2]),
+        ];
+    }
+    vec![group.to_owned()]
 }
 
 pub(super) fn response_time_stats(history: &[CheckRecord]) -> (ResponseTimeStats, Option<f64>) {
@@ -665,6 +743,7 @@ struct MetricChartView {
 #[derive(Serialize)]
 struct MetricChartSeries {
     key: String,
+    label: String,
     color_index: usize,
     line_paths: Vec<MetricChartLine>,
     points: Vec<MetricChartPoint>,

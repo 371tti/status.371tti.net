@@ -124,7 +124,7 @@
     <article class="metric-chart-card">
       <div class="metric-chart-legend" role="list" aria-label="Metrics in {{ group.name }}">
         {% for series in chart.series %}
-        <span class="metric-chart-legend-item" role="listitem"><i class="metric-chart-legend-mark metric-series-{{ series.color_index }}" aria-hidden="true"></i>{{ series.key }}</span>
+        <span class="metric-chart-legend-item" role="listitem"><i class="metric-chart-legend-mark metric-series-{{ series.color_index }}" aria-hidden="true"></i>{{ series.label }}</span>
         {% endfor %}
       </div>
       <div class="metric-chart-shell" data-metric-start-ms="{{ chart.start_timestamp_ms }}" data-metric-end-ms="{{ chart.end_timestamp_ms }}">
@@ -143,7 +143,7 @@
             {% endfor %}
             <line class="metric-chart-hover-line" data-metric-hover-line x1="0" y1="12" x2="0" y2="132" aria-hidden="true"></line>
             {% for series in chart.series %}
-            {% for point in series.points %}<circle class="metric-chart-point-hit" cx="{{ point.x }}" cy="{{ point.y }}" r="9" data-timestamp-ms="{{ point.timestamp_ms }}" data-checked-at="{{ point.checked_at }}" data-key="{{ series.key }}" data-value="{{ point.value }}" data-color-index="{{ point.color_index }}" tabindex="0" role="img" aria-label="{{ point.aria_label }}"></circle><circle class="metric-chart-point metric-series-{{ point.color_index }}" cx="{{ point.x }}" cy="{{ point.y }}" r="3.5" aria-hidden="true"></circle>{% endfor %}
+            {% for point in series.points %}<circle class="metric-chart-point-hit" cx="{{ point.x }}" cy="{{ point.y }}" r="9" data-timestamp-ms="{{ point.timestamp_ms }}" data-checked-at="{{ point.checked_at }}" data-key="{{ series.label }}" data-value="{{ point.value }}" data-color-index="{{ point.color_index }}" tabindex="0" role="img" aria-label="{{ point.aria_label }}"></circle><circle class="metric-chart-point metric-series-{{ point.color_index }}" cx="{{ point.x }}" cy="{{ point.y }}" r="3.5" aria-hidden="true"></circle>{% endfor %}
             {% endfor %}
           </svg>
         </div>

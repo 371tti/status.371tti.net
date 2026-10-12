@@ -25,7 +25,7 @@ storage:
 # Numeric response keys are graphed. `<group>.unit <text>` labels that graph group.
 # IDs without a dot appear under "Other".
 monitors:
-  - id: internet.371tti-net
+  - id: web.371tti-net
     name: 371tti.net
     type: http
     url: https://371tti.net
@@ -36,7 +36,7 @@ monitors:
     status_codes: [200, 204]
     headers: {}
 
-  - id: dev371tti-net
+  - id: web.dev.371tti.net
     name: dev.371tti.net
     type: http
     url: https://dev.371tti.net
@@ -48,7 +48,7 @@ monitors:
     status_codes: [200, 204]
     headers: {}
 
-  - id: self.ping
+  - id: web.self.ping
     name: Status server
     type: http
     url: http://127.0.0.1:85/ping
@@ -61,13 +61,14 @@ monitors:
     hide_target: true
     # /ping returns server.requests.unit requests and process.unit s for the metric graphs.
 
-  - id: internet.ping-1-1-1-1
-    name: Ping 1.1.1.1
-    type: ping
-    host: 1.1.1.1
-    interval: 60
-    timeout: 5
-    slow_ms: 100
+  - id: web.proxy-server
+    name: web-proxy-server
+    type: tcp
+    host: 192.168.0.50
+    port: 9791
+    send: "METRICS\n"
+    slow_ms: 500
+    hide_target: true
 
 # HTTP/S with key-value metrics in the response body:
 #   - id: production.api
@@ -124,8 +125,8 @@ monitors:
 #     timeout: 5
 #     slow_ms: 500
 #     send: "METRICS <token>\n"
-#     # The agent includes group units such as cpu.percent.unit %, memory.bytes.unit B,
-#     # and network.eth0.bytes.unit B/s with per-interface rx/tx traffic rates.
+#     # The agent returns grouped metrics such as cpu.core.percent.all,
+#     # cpu.core.percent.0, memory.bytes.used, and network.bytes.rx.<interface>.
 #     response_codes:
 #       0: operational
 #       1: degraded

@@ -1,12 +1,13 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         error::Error,
         fmt::Write as FmtWrite,
         fs,
         io::{self, Read, Write as IoWrite},
         net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+        path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -26,8 +27,68 @@ mod linux {
         token: Option<String>,
         started_at: Instant,
         options: MetricOptions,
+        environment: RuntimeEnvironment,
+        cgroups: Option<CgroupResources>,
+        lxcfs_proc: LxcfsProcFiles,
         cpu_metrics: Option<Arc<Mutex<Option<CpuMetrics>>>>,
         network_previous: Mutex<Option<NetworkSnapshot>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RuntimeEnvironment {
+        Lxc,
+        Container,
+        VirtualMachine,
+        Host,
+    }
+
+    impl RuntimeEnvironment {
+        fn is_container(self) -> bool {
+            matches!(self, Self::Lxc | Self::Container)
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Lxc => "LXC container",
+                Self::Container => "container",
+                Self::VirtualMachine => "virtual machine guest",
+                Self::Host => "host",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct LxcfsProcFiles {
+        stat: bool,
+        meminfo: bool,
+    }
+
+    struct CgroupResources {
+        cpu: Option<CgroupCpuPath>,
+        memory: Option<CgroupMemoryPath>,
+    }
+
+    #[derive(Clone)]
+    enum CgroupCpuPath {
+        V2(PathBuf),
+        V1 {
+            cpu: Option<PathBuf>,
+            cpuacct: PathBuf,
+            cpuset: Option<PathBuf>,
+        },
+    }
+
+    #[derive(Clone)]
+    enum CgroupMemoryPath {
+        V2(PathBuf),
+        V1(PathBuf),
+    }
+
+    struct CgroupMountInfo {
+        kind: String,
+        root: PathBuf,
+        mountpoint: PathBuf,
+        controllers: BTreeSet<String>,
     }
 
     #[derive(Clone, Copy)]
@@ -61,7 +122,7 @@ mod linux {
     #[derive(Clone, Copy)]
     struct CpuPercentages {
         usage: f64,
-        iowait: f64,
+        iowait: Option<f64>,
     }
 
     #[derive(Clone)]
@@ -70,9 +131,25 @@ mod linux {
         cores: BTreeMap<usize, CpuPercentages>,
     }
 
+    enum CpuSamplerSource {
+        Proc,
+        Cgroup(CgroupCpuPath),
+    }
+
+    enum CpuSample {
+        Proc(CpuSnapshot),
+        Cgroup { usage_ns: u64, capacity_cores: f64 },
+    }
+
+    struct TimedCpuSample {
+        sampled_at: Instant,
+        sample: CpuSample,
+    }
+
     struct Memory {
-        total_bytes: u64,
-        available_bytes: u64,
+        used_bytes: u64,
+        total_bytes: Option<u64>,
+        available_bytes: Option<u64>,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -136,11 +213,38 @@ mod linux {
             load: read_env_flag("WS371_AGENT_ENABLE_LOAD", true)?,
             network: read_env_flag("WS371_AGENT_ENABLE_NETWORK", true)?,
         };
+        let lxcfs_proc = detect_lxcfs_proc_files();
+        let environment = detect_runtime_environment(lxcfs_proc);
+        let cgroups = environment
+            .is_container()
+            .then(discover_cgroup_resources)
+            .flatten();
+        eprintln!("detected {}", environment.label());
+        if environment.is_container() && cgroups.is_none() {
+            eprintln!(
+                "container cgroups could not be resolved; host-wide proc values will be omitted where they cannot be scoped safely"
+            );
+        }
+        let cpu_source = if !environment.is_container() || lxcfs_proc.stat {
+            Some(CpuSamplerSource::Proc)
+        } else {
+            cgroups
+                .as_ref()
+                .and_then(|resources| resources.cpu.clone())
+                .map(CpuSamplerSource::Cgroup)
+        };
+        if options.cpu && cpu_source.is_none() {
+            eprintln!("CPU metrics are unavailable: no container-scoped CPU source was found");
+        }
         let cpu_metrics = if options.cpu {
-            let metrics = Arc::new(Mutex::new(None));
-            let cpu_sample_ready = start_cpu_sampler(Arc::clone(&metrics));
-            let _ = cpu_sample_ready.recv_timeout(Duration::from_secs(3));
-            Some(metrics)
+            if let Some(cpu_source) = cpu_source {
+                let metrics = Arc::new(Mutex::new(None));
+                let cpu_sample_ready = start_cpu_sampler(Arc::clone(&metrics), cpu_source);
+                let _ = cpu_sample_ready.recv_timeout(Duration::from_secs(3));
+                Some(metrics)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -158,6 +262,9 @@ mod linux {
             token,
             started_at: Instant::now(),
             options,
+            environment,
+            cgroups,
+            lxcfs_proc,
             cpu_metrics,
             network_previous: Mutex::new(network_previous),
         });
@@ -300,14 +407,32 @@ mod linux {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
         });
-        let memory = state.options.memory.then(read_memory);
-        let uptime = read_host_uptime();
-        let load = state.options.load.then(read_load_average);
+        let memory = state.options.memory.then(|| {
+            if state.environment.is_container() {
+                if let Some(path) = state
+                    .cgroups
+                    .as_ref()
+                    .and_then(|resources| resources.memory.as_ref())
+                {
+                    return read_cgroup_memory(path);
+                }
+                if !state.lxcfs_proc.meminfo {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "container-scoped memory data is unavailable",
+                    ));
+                }
+            }
+            read_memory()
+        });
+        let uptime = (!state.environment.is_container()).then(read_host_uptime);
+        let load =
+            (state.options.load && !state.environment.is_container()).then(read_load_average);
         let network = state.options.network.then(|| sample_network(state));
         let mut status_code = 0;
         if (state.options.cpu && cpu_metrics.is_none())
             || memory.as_ref().is_some_and(Result::is_err)
-            || uptime.is_err()
+            || uptime.as_ref().is_some_and(Result::is_err)
             || load.as_ref().is_some_and(Result::is_err)
             || network.as_ref().is_some_and(Result::is_err)
         {
@@ -317,46 +442,43 @@ mod linux {
         let mut output = String::new();
         let _ = writeln!(output, "status.code {status_code}");
         if let Some(cpu_metrics) = cpu_metrics {
-            let _ = writeln!(output, "cpu.cores.unit cores");
-            let _ = writeln!(output, "cpu.cores.count {}", cpu_metrics.cores.len());
-            let _ = writeln!(output, "cpu.percent.unit %");
+            if !cpu_metrics.cores.is_empty() {
+                let _ = writeln!(output, "cpu.cores.unit cores");
+                let _ = writeln!(output, "cpu.cores.count {}", cpu_metrics.cores.len());
+            }
+            let _ = writeln!(output, "cpu.core.percent.unit %");
             let _ = writeln!(
                 output,
-                "cpu.percent.usage {:.2}",
+                "cpu.core.percent.all {:.2}",
                 cpu_metrics.aggregate.usage
             );
-            let _ = writeln!(
-                output,
-                "cpu.percent.iowait {:.2}",
-                cpu_metrics.aggregate.iowait
-            );
+            let _ = writeln!(output, "cpu.core.iowait.unit %");
+            if let Some(iowait) = cpu_metrics.aggregate.iowait {
+                let _ = writeln!(output, "cpu.core.iowait.all {iowait:.2}");
+            }
             for (core, percentages) in cpu_metrics.cores {
-                let _ = writeln!(output, "cpu.core.{core}.percent.unit %");
-                let _ = writeln!(
-                    output,
-                    "cpu.core.{core}.percent.usage {:.2}",
-                    percentages.usage
-                );
-                let _ = writeln!(
-                    output,
-                    "cpu.core.{core}.percent.iowait {:.2}",
-                    percentages.iowait
-                );
+                let _ = writeln!(output, "cpu.core.percent.{core} {:.2}", percentages.usage);
+                if let Some(iowait) = percentages.iowait {
+                    let _ = writeln!(output, "cpu.core.iowait.{core} {iowait:.2}");
+                }
             }
         }
         if let Some(Ok(memory)) = memory.as_ref() {
-            let used_bytes = memory.total_bytes.saturating_sub(memory.available_bytes);
-            let usage_percent = if memory.total_bytes == 0 {
-                0.0
-            } else {
-                used_bytes as f64 * 100.0 / memory.total_bytes as f64
-            };
             let _ = writeln!(output, "memory.bytes.unit B");
-            let _ = writeln!(output, "memory.bytes.used {used_bytes}");
-            let _ = writeln!(output, "memory.bytes.available {}", memory.available_bytes);
-            let _ = writeln!(output, "memory.bytes.total {}", memory.total_bytes);
-            let _ = writeln!(output, "memory.percent.unit %");
-            let _ = writeln!(output, "memory.percent.usage {usage_percent:.2}");
+            let _ = writeln!(output, "memory.bytes.used {}", memory.used_bytes);
+            if let (Some(total_bytes), Some(available_bytes)) =
+                (memory.total_bytes, memory.available_bytes)
+            {
+                let usage_percent = if total_bytes == 0 {
+                    0.0
+                } else {
+                    (memory.used_bytes as f64 * 100.0 / total_bytes as f64).clamp(0.0, 100.0)
+                };
+                let _ = writeln!(output, "memory.bytes.available {available_bytes}");
+                let _ = writeln!(output, "memory.bytes.total {total_bytes}");
+                let _ = writeln!(output, "memory.percent.unit %");
+                let _ = writeln!(output, "memory.percent.usage {usage_percent:.2}");
+            }
         }
         if let Some(Ok(load)) = load.as_ref() {
             let _ = writeln!(output, "system.load.unit tasks");
@@ -371,55 +493,63 @@ mod linux {
                 "network.interfaces.count {}",
                 network.interface_count
             );
+            for (group, unit) in [
+                ("network.bytes.rx", "B/s"),
+                ("network.bytes.tx", "B/s"),
+                ("network.packets.rx", "packets/s"),
+                ("network.packets.tx", "packets/s"),
+                ("network.errors.rx", "errors/s"),
+                ("network.errors.tx", "errors/s"),
+                ("network.drops.rx", "drops/s"),
+                ("network.drops.tx", "drops/s"),
+            ] {
+                let _ = writeln!(output, "{group}.unit {unit}");
+            }
             for (interface, rates) in &network.interfaces {
                 let interface = metric_segment(interface);
-                let _ = writeln!(output, "network.{interface}.bytes.unit B/s");
                 let _ = writeln!(
                     output,
-                    "network.{interface}.bytes.rx {:.2}",
+                    "network.bytes.rx.{interface} {:.2}",
                     rates.rx_bytes_per_second
                 );
                 let _ = writeln!(
                     output,
-                    "network.{interface}.bytes.tx {:.2}",
+                    "network.bytes.tx.{interface} {:.2}",
                     rates.tx_bytes_per_second
                 );
-                let _ = writeln!(output, "network.{interface}.packets.unit packets/s");
                 let _ = writeln!(
                     output,
-                    "network.{interface}.packets.rx {:.2}",
+                    "network.packets.rx.{interface} {:.2}",
                     rates.rx_packets_per_second
                 );
                 let _ = writeln!(
                     output,
-                    "network.{interface}.packets.tx {:.2}",
+                    "network.packets.tx.{interface} {:.2}",
                     rates.tx_packets_per_second
                 );
-                let _ = writeln!(output, "network.{interface}.errors.unit errors/s");
                 let _ = writeln!(
                     output,
-                    "network.{interface}.errors.rx {:.2}",
+                    "network.errors.rx.{interface} {:.2}",
                     rates.rx_errors_per_second
                 );
                 let _ = writeln!(
                     output,
-                    "network.{interface}.errors.tx {:.2}",
+                    "network.errors.tx.{interface} {:.2}",
                     rates.tx_errors_per_second
                 );
-                let _ = writeln!(output, "network.{interface}.drops.unit drops/s");
                 let _ = writeln!(
                     output,
-                    "network.{interface}.drops.rx {:.2}",
+                    "network.drops.rx.{interface} {:.2}",
                     rates.rx_drops_per_second
                 );
                 let _ = writeln!(
                     output,
-                    "network.{interface}.drops.tx {:.2}",
+                    "network.drops.tx.{interface} {:.2}",
                     rates.tx_drops_per_second
                 );
             }
         }
-        if let Ok(uptime) = uptime {
+        if let Some(Ok(uptime)) = uptime {
             let _ = writeln!(output, "system.unit s");
             let _ = writeln!(output, "system.uptime_seconds {uptime:.2}");
         }
@@ -568,32 +698,32 @@ mod linux {
         Ok(interfaces)
     }
 
-    fn start_cpu_sampler(metrics: Arc<Mutex<Option<CpuMetrics>>>) -> mpsc::Receiver<()> {
+    fn start_cpu_sampler(
+        metrics: Arc<Mutex<Option<CpuMetrics>>>,
+        source: CpuSamplerSource,
+    ) -> mpsc::Receiver<()> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         thread::Builder::new()
             .name("cpu-sampler".to_owned())
             .spawn(move || {
-                let mut previous = read_cpu_times().ok();
+                let mut previous = read_cpu_sample(&source).ok().map(|sample| TimedCpuSample {
+                    sampled_at: Instant::now(),
+                    sample,
+                });
                 let mut ready_sender = Some(ready_sender);
                 loop {
                     thread::sleep(Duration::from_secs(1));
-                    let Ok(current) = read_cpu_times() else {
+                    let Ok(sample) = read_cpu_sample(&source) else {
                         continue;
                     };
+                    let current = TimedCpuSample {
+                        sampled_at: Instant::now(),
+                        sample,
+                    };
                     if let Some(previous) = previous.as_ref() {
-                        if let Some(aggregate) =
-                            calculate_cpu_percentages(previous.aggregate, current.aggregate)
-                        {
-                            let cores = current
-                                .cores
-                                .iter()
-                                .filter_map(|(core, counters)| {
-                                    let previous = previous.cores.get(core)?;
-                                    Some((*core, calculate_cpu_percentages(*previous, *counters)?))
-                                })
-                                .collect();
+                        if let Some(cpu_metrics) = calculate_cpu_metrics(previous, &current) {
                             *metrics.lock().unwrap_or_else(|error| error.into_inner()) =
-                                Some(CpuMetrics { aggregate, cores });
+                                Some(cpu_metrics);
                             if let Some(sender) = ready_sender.take() {
                                 let _ = sender.send(());
                             }
@@ -604,6 +734,67 @@ mod linux {
             })
             .expect("failed to start CPU sampler");
         ready_receiver
+    }
+
+    fn read_cpu_sample(source: &CpuSamplerSource) -> io::Result<CpuSample> {
+        match source {
+            CpuSamplerSource::Proc => read_cpu_times().map(CpuSample::Proc),
+            CpuSamplerSource::Cgroup(path) => {
+                let (usage_ns, capacity_cores) = read_cgroup_cpu(path)?;
+                Ok(CpuSample::Cgroup {
+                    usage_ns,
+                    capacity_cores,
+                })
+            }
+        }
+    }
+
+    fn calculate_cpu_metrics(
+        previous: &TimedCpuSample,
+        current: &TimedCpuSample,
+    ) -> Option<CpuMetrics> {
+        match (&previous.sample, &current.sample) {
+            (CpuSample::Proc(previous), CpuSample::Proc(current)) => {
+                let aggregate = calculate_cpu_percentages(previous.aggregate, current.aggregate)?;
+                let cores = current
+                    .cores
+                    .iter()
+                    .filter_map(|(core, counters)| {
+                        let previous = previous.cores.get(core)?;
+                        Some((*core, calculate_cpu_percentages(*previous, *counters)?))
+                    })
+                    .collect();
+                Some(CpuMetrics { aggregate, cores })
+            }
+            (
+                CpuSample::Cgroup {
+                    usage_ns: previous_usage,
+                    ..
+                },
+                CpuSample::Cgroup {
+                    usage_ns: current_usage,
+                    capacity_cores,
+                },
+            ) => {
+                let elapsed_ns = current
+                    .sampled_at
+                    .saturating_duration_since(previous.sampled_at)
+                    .as_nanos() as f64;
+                if elapsed_ns <= 0.0 || *capacity_cores <= 0.0 {
+                    return None;
+                }
+                let usage_percent = current_usage.saturating_sub(*previous_usage) as f64 * 100.0
+                    / (elapsed_ns * capacity_cores);
+                Some(CpuMetrics {
+                    aggregate: CpuPercentages {
+                        usage: usage_percent.clamp(0.0, 100.0),
+                        iowait: None,
+                    },
+                    cores: BTreeMap::new(),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn calculate_cpu_percentages(previous: CpuTimes, current: CpuTimes) -> Option<CpuPercentages> {
@@ -618,7 +809,7 @@ mod linux {
             .saturating_sub(iowait_delta);
         Some(CpuPercentages {
             usage: (busy_delta as f64 * 100.0 / total_delta as f64).clamp(0.0, 100.0),
-            iowait: (iowait_delta as f64 * 100.0 / total_delta as f64).clamp(0.0, 100.0),
+            iowait: Some((iowait_delta as f64 * 100.0 / total_delta as f64).clamp(0.0, 100.0)),
         })
     }
 
@@ -676,6 +867,507 @@ mod linux {
         Ok(CpuSnapshot { aggregate, cores })
     }
 
+    fn detect_runtime_environment(lxcfs_proc: LxcfsProcFiles) -> RuntimeEnvironment {
+        let systemd_container = fs::read_to_string("/run/systemd/container")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let cgroup_text = fs::read_to_string("/proc/1/cgroup")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if systemd_container.contains("lxc")
+            || cgroup_text.contains("/lxc/")
+            || cgroup_text.contains("lxc.payload")
+            || lxcfs_proc.stat
+            || lxcfs_proc.meminfo
+        {
+            return RuntimeEnvironment::Lxc;
+        }
+        if Path::new("/.dockerenv").exists()
+            || Path::new("/run/.containerenv").exists()
+            || systemd_container.contains("docker")
+            || systemd_container.contains("podman")
+            || cgroup_text.contains("docker")
+            || cgroup_text.contains("containerd")
+            || cgroup_text.contains("kubepods")
+            || cgroup_text.contains("libpod")
+        {
+            return RuntimeEnvironment::Container;
+        }
+        if is_virtual_machine() {
+            RuntimeEnvironment::VirtualMachine
+        } else {
+            RuntimeEnvironment::Host
+        }
+    }
+
+    fn is_virtual_machine() -> bool {
+        if Path::new("/sys/hypervisor/type").exists() {
+            return true;
+        }
+        let dmi = [
+            "/sys/class/dmi/id/sys_vendor",
+            "/sys/class/dmi/id/product_name",
+            "/sys/class/dmi/id/board_vendor",
+        ]
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .collect::<String>()
+        .to_ascii_lowercase();
+        if [
+            "kvm",
+            "qemu",
+            "vmware",
+            "virtualbox",
+            "xen",
+            "bochs",
+            "hyper-v",
+            "virtual machine",
+            "amazon ec2",
+            "google",
+            "openstack",
+            "parallels",
+            "bhyve",
+        ]
+        .iter()
+        .any(|marker| dmi.contains(marker))
+        {
+            return true;
+        }
+        fs::read_to_string("/proc/cpuinfo").is_ok_and(|contents| {
+            contents.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, values)| {
+                    matches!(name.trim(), "flags" | "Features")
+                        && values
+                            .split_ascii_whitespace()
+                            .any(|value| value == "hypervisor")
+                })
+            })
+        })
+    }
+
+    fn detect_lxcfs_proc_files() -> LxcfsProcFiles {
+        let mut files = LxcfsProcFiles::default();
+        let Ok(contents) = fs::read_to_string("/proc/self/mountinfo") else {
+            return files;
+        };
+        for line in contents.lines() {
+            let Some((mount_fields, fs_fields)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mount_fields = mount_fields.split_ascii_whitespace().collect::<Vec<_>>();
+            let fs_fields = fs_fields.split_ascii_whitespace().collect::<Vec<_>>();
+            if mount_fields.len() < 5 || fs_fields.len() < 2 {
+                continue;
+            }
+            let is_lxcfs = fs_fields[0].to_ascii_lowercase().contains("lxcfs")
+                || fs_fields[1].to_ascii_lowercase().contains("lxcfs");
+            if !is_lxcfs {
+                continue;
+            }
+            match unescape_mount_path(mount_fields[4])
+                .to_string_lossy()
+                .as_ref()
+            {
+                "/proc/stat" => files.stat = true,
+                "/proc/meminfo" => files.meminfo = true,
+                _ => {}
+            }
+        }
+        files
+    }
+
+    fn unescape_mount_path(value: &str) -> PathBuf {
+        let mut decoded = Vec::with_capacity(value.len());
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\\' && index + 3 < bytes.len() {
+                let code = &value[index + 1..index + 4];
+                let decoded_byte = match code {
+                    "040" => Some(b' '),
+                    "011" => Some(b'\t'),
+                    "012" => Some(b'\n'),
+                    "134" => Some(b'\\'),
+                    _ => None,
+                };
+                if let Some(byte) = decoded_byte {
+                    decoded.push(byte);
+                    index += 4;
+                    continue;
+                }
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+    }
+
+    fn read_cgroup_mounts() -> io::Result<Vec<CgroupMountInfo>> {
+        let contents = fs::read_to_string("/proc/self/mountinfo")?;
+        let mut mounts = Vec::new();
+        for line in contents.lines() {
+            let Some((mount_fields, fs_fields)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mount_fields = mount_fields.split_ascii_whitespace().collect::<Vec<_>>();
+            let fs_fields = fs_fields.split_ascii_whitespace().collect::<Vec<_>>();
+            if mount_fields.len() < 6 || fs_fields.len() < 3 {
+                continue;
+            }
+            let kind = fs_fields[0];
+            if kind != "cgroup" && kind != "cgroup2" {
+                continue;
+            }
+            let mut controllers = BTreeSet::new();
+            for option in [mount_fields[5], fs_fields[2]] {
+                controllers.extend(
+                    option
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            mounts.push(CgroupMountInfo {
+                kind: kind.to_owned(),
+                root: unescape_mount_path(mount_fields[3]),
+                mountpoint: unescape_mount_path(mount_fields[4]),
+                controllers,
+            });
+        }
+        Ok(mounts)
+    }
+
+    fn read_cgroup_memberships(pid: u32) -> io::Result<BTreeMap<String, String>> {
+        let contents = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+        let mut memberships = BTreeMap::new();
+        for line in contents.lines() {
+            let Some((_, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let Some((controllers, path)) = rest.split_once(':') else {
+                continue;
+            };
+            if controllers.is_empty() {
+                memberships.insert("unified".to_owned(), path.to_owned());
+            } else {
+                for controller in controllers.split(',') {
+                    memberships.insert(controller.to_owned(), path.to_owned());
+                }
+            }
+        }
+        Ok(memberships)
+    }
+
+    fn cgroup_mount_for<'a>(
+        mounts: &'a [CgroupMountInfo],
+        kind: &str,
+        controller: Option<&str>,
+    ) -> Option<&'a CgroupMountInfo> {
+        mounts.iter().find(|mount| {
+            mount.kind == kind
+                && controller.is_none_or(|controller| mount.controllers.contains(controller))
+        })
+    }
+
+    fn membership_for<'a>(
+        memberships: &'a BTreeMap<String, String>,
+        controller: &str,
+    ) -> Option<&'a str> {
+        memberships.get(controller).map(String::as_str)
+    }
+
+    fn map_cgroup_path(mount: &CgroupMountInfo, membership: &str) -> Option<PathBuf> {
+        let relative = Path::new(membership).strip_prefix(&mount.root).ok()?;
+        Some(mount.mountpoint.join(relative))
+    }
+
+    fn container_cgroup_dir(
+        mount: &CgroupMountInfo,
+        current_membership: &str,
+        init_membership: &str,
+    ) -> Option<PathBuf> {
+        let current = map_cgroup_path(mount, current_membership)?;
+        let init = map_cgroup_path(mount, init_membership)?;
+        for path in [&current, &init] {
+            if let Some(boundary) = lxc_cgroup_boundary(path) {
+                if current.starts_with(&boundary) || init.starts_with(&boundary) {
+                    return Some(boundary);
+                }
+            }
+        }
+        let mut candidate = current;
+        while candidate.starts_with(&mount.mountpoint) {
+            if init.starts_with(&candidate) {
+                return Some(candidate);
+            }
+            if candidate == mount.mountpoint || !candidate.pop() {
+                break;
+            }
+        }
+        Some(mount.mountpoint.clone())
+    }
+
+    fn lxc_cgroup_boundary(path: &Path) -> Option<PathBuf> {
+        let components = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>();
+        let lxc_index = components
+            .iter()
+            .position(|component| *component == "lxc")?;
+        let name = components.get(lxc_index + 1)?;
+        let mut boundary = PathBuf::new();
+        for component in components.iter().take(lxc_index + 2) {
+            boundary.push(component);
+        }
+        (!name.is_empty()).then_some(boundary)
+    }
+
+    fn discover_cgroup_resources() -> Option<CgroupResources> {
+        let mounts = read_cgroup_mounts().ok()?;
+        let current = read_cgroup_memberships(std::process::id()).ok()?;
+        let init = read_cgroup_memberships(1).ok()?;
+        let mut cpu = None;
+        let mut memory = None;
+
+        if let Some(mount) = cgroup_mount_for(&mounts, "cgroup2", None) {
+            if let (Some(current_path), Some(init_path)) = (
+                membership_for(&current, "unified"),
+                membership_for(&init, "unified"),
+            ) {
+                if let Some(directory) = container_cgroup_dir(mount, current_path, init_path) {
+                    if directory.join("cpu.stat").is_file() {
+                        cpu = Some(CgroupCpuPath::V2(directory.clone()));
+                    }
+                    if directory.join("memory.current").is_file() {
+                        memory = Some(CgroupMemoryPath::V2(directory));
+                    }
+                }
+            }
+        }
+
+        if cpu.is_none() || memory.is_none() {
+            let cpuacct_mount = cgroup_mount_for(&mounts, "cgroup", Some("cpuacct"));
+            let cpu_mount = cgroup_mount_for(&mounts, "cgroup", Some("cpu"));
+            let cpuset_mount = cgroup_mount_for(&mounts, "cgroup", Some("cpuset"));
+            let memory_mount = cgroup_mount_for(&mounts, "cgroup", Some("memory"));
+            let controller_dir = |mount: Option<&CgroupMountInfo>, controller: &str| {
+                let mount = mount?;
+                let current_path = membership_for(&current, controller)?;
+                let init_path = membership_for(&init, controller)?;
+                container_cgroup_dir(mount, current_path, init_path)
+            };
+
+            if cpu.is_none() {
+                if let Some(cpuacct_dir) = controller_dir(cpuacct_mount, "cpuacct") {
+                    if cpuacct_dir.join("cpuacct.usage").is_file() {
+                        let cpu_dir = controller_dir(cpu_mount, "cpu");
+                        let cpuset_dir = controller_dir(cpuset_mount, "cpuset");
+                        cpu = Some(CgroupCpuPath::V1 {
+                            cpu: cpu_dir,
+                            cpuacct: cpuacct_dir,
+                            cpuset: cpuset_dir,
+                        });
+                    }
+                }
+            }
+            if memory.is_none() {
+                if let Some(memory_dir) = controller_dir(memory_mount, "memory") {
+                    if memory_dir.join("memory.usage_in_bytes").is_file() {
+                        memory = Some(CgroupMemoryPath::V1(memory_dir));
+                    }
+                }
+            }
+        }
+
+        (cpu.is_some() || memory.is_some()).then_some(CgroupResources { cpu, memory })
+    }
+
+    fn read_cgroup_cpu(path: &CgroupCpuPath) -> io::Result<(u64, f64)> {
+        match path {
+            CgroupCpuPath::V2(directory) => {
+                let contents = fs::read_to_string(directory.join("cpu.stat"))?;
+                let usage_usec = contents
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(' ')?;
+                        (key == "usage_usec")
+                            .then(|| value.trim().parse::<u64>().ok())
+                            .flatten()
+                    })
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing cpu.stat usage_usec")
+                    })?;
+                Ok((
+                    usage_usec.saturating_mul(1_000),
+                    cgroup_v2_capacity(directory),
+                ))
+            }
+            CgroupCpuPath::V1 {
+                cpu,
+                cpuacct,
+                cpuset,
+            } => {
+                let usage_ns = read_u64_file(&cpuacct.join("cpuacct.usage"))?;
+                Ok((
+                    usage_ns,
+                    cgroup_v1_capacity(cpu.as_deref(), cpuset.as_deref()),
+                ))
+            }
+        }
+    }
+
+    fn read_cgroup_memory(path: &CgroupMemoryPath) -> io::Result<Memory> {
+        let (used_bytes, configured_limit) = match path {
+            CgroupMemoryPath::V2(directory) => {
+                let used = read_u64_file(&directory.join("memory.current"))?;
+                let limit = ancestor_memory_limit(directory, "memory.max", true);
+                (used, limit)
+            }
+            CgroupMemoryPath::V1(directory) => {
+                let used = read_u64_file(&directory.join("memory.usage_in_bytes"))?;
+                let limit = ancestor_memory_limit(directory, "memory.limit_in_bytes", false);
+                (used, limit)
+            }
+        };
+        let total_bytes = configured_limit.filter(|limit| *limit > 0);
+        Ok(Memory {
+            total_bytes,
+            used_bytes,
+            available_bytes: total_bytes.map(|total| total.saturating_sub(used_bytes)),
+        })
+    }
+
+    fn ancestor_memory_limit(directory: &Path, filename: &str, v2: bool) -> Option<u64> {
+        let mut current = Some(directory);
+        let mut minimum = None::<u64>;
+        while let Some(path) = current {
+            if let Ok(value) = fs::read_to_string(path.join(filename)) {
+                let limit = if v2 {
+                    value.trim().parse::<u64>().ok()
+                } else {
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| *value < i64::MAX as u64 / 2)
+                };
+                if let Some(limit) = limit.filter(|value| *value > 0) {
+                    minimum = Some(minimum.map_or(limit, |existing| existing.min(limit)));
+                }
+            }
+            current = path.parent();
+        }
+        minimum
+    }
+
+    fn read_u64_file(path: &Path) -> io::Result<u64> {
+        fs::read_to_string(path)?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn cgroup_v2_capacity(directory: &Path) -> f64 {
+        let cpus = ancestor_cpuset_count(directory, "cpuset.cpus.effective")
+            .or_else(|| ancestor_cpuset_count(directory, "cpuset.cpus"));
+        let quota = ancestor_quota(directory, "cpu.max", true);
+        effective_cpu_capacity(cpus, quota)
+    }
+
+    fn cgroup_v1_capacity(cpu: Option<&Path>, cpuset: Option<&Path>) -> f64 {
+        let cpus = cpuset.and_then(|directory| ancestor_cpuset_count(directory, "cpuset.cpus"));
+        let quota = cpu.and_then(|directory| ancestor_quota(directory, "cpu.cfs_quota_us", false));
+        effective_cpu_capacity(cpus, quota)
+    }
+
+    fn effective_cpu_capacity(cpus: Option<f64>, quota: Option<f64>) -> f64 {
+        match (cpus, quota) {
+            (Some(cpus), Some(quota)) => cpus.min(quota).max(0.01),
+            (Some(cpus), None) => cpus.max(0.01),
+            (None, Some(quota)) => quota.max(0.01),
+            (None, None) => std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1) as f64,
+        }
+    }
+
+    fn ancestor_cpuset_count(directory: &Path, filename: &str) -> Option<f64> {
+        let mut current = Some(directory);
+        while let Some(path) = current {
+            if let Ok(value) = fs::read_to_string(path.join(filename)) {
+                if let Some(count) = parse_cpu_set_count(value.trim()) {
+                    return Some(count as f64);
+                }
+            }
+            current = path.parent();
+        }
+        None
+    }
+
+    fn ancestor_quota(directory: &Path, filename: &str, v2: bool) -> Option<f64> {
+        let mut current = Some(directory);
+        let mut minimum = None::<f64>;
+        while let Some(path) = current {
+            if let Ok(contents) = fs::read_to_string(path.join(filename)) {
+                let quota = if v2 {
+                    let mut fields = contents.split_ascii_whitespace();
+                    match (fields.next(), fields.next()) {
+                        (Some("max"), _) | (None, _) => None,
+                        (Some(quota), Some(period)) => quota
+                            .parse::<f64>()
+                            .ok()
+                            .zip(period.parse::<f64>().ok())
+                            .filter(|(quota, period)| *quota > 0.0 && *period > 0.0)
+                            .map(|(quota, period)| quota / period),
+                        _ => None,
+                    }
+                } else {
+                    let quota = contents
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value > 0);
+                    let period = fs::read_to_string(path.join("cpu.cfs_period_us"))
+                        .ok()
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                        .filter(|value| *value > 0.0);
+                    quota
+                        .map(|value| value as f64)
+                        .zip(period)
+                        .map(|(quota, period)| quota / period)
+                };
+                if let Some(quota) = quota {
+                    minimum = Some(minimum.map_or(quota, |existing| existing.min(quota)));
+                }
+            }
+            current = path.parent();
+        }
+        minimum
+    }
+
+    fn parse_cpu_set_count(value: &str) -> Option<usize> {
+        if value.is_empty() {
+            return None;
+        }
+        let mut count = 0usize;
+        for part in value.split(',') {
+            if let Some((first, last)) = part.split_once('-') {
+                let first = first.trim().parse::<usize>().ok()?;
+                let last = last.trim().parse::<usize>().ok()?;
+                if last < first {
+                    return None;
+                }
+                count = count.saturating_add(last - first + 1);
+            } else {
+                part.trim().parse::<usize>().ok()?;
+                count = count.saturating_add(1);
+            }
+        }
+        (count > 0).then_some(count)
+    }
+
     fn read_memory() -> io::Result<Memory> {
         let contents = fs::read_to_string("/proc/meminfo")?;
         let mut total_kib = None;
@@ -704,8 +1396,9 @@ mod linux {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing MemTotal"))?;
         let available_kib = available_kib.unwrap_or(fallback_available_kib);
         Ok(Memory {
-            total_bytes: total_kib.saturating_mul(1024),
-            available_bytes: available_kib.saturating_mul(1024),
+            used_bytes: total_kib.saturating_sub(available_kib).saturating_mul(1024),
+            total_bytes: Some(total_kib.saturating_mul(1024)),
+            available_bytes: Some(available_kib.saturating_mul(1024)),
         })
     }
 

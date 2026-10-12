@@ -10,6 +10,8 @@ cargo run -p wk-status-371tti-net -- config.yaml
 
 設定ファイルがない場合は、コメント付きの初期設定を生成します。初期状態では `http://127.0.0.1:3000` で開きます。設定変更後は再起動してください。
 
+ログは既定でINFOレベルです。起動、HTTPアクセス、監視結果、履歴の保存・整理エラーを出力します。`RUST_LOG=debug`（PowerShellでは `$env:RUST_LOG = "debug"`）で詳細ログに切り替えられます。
+
 ```powershell
 cargo build --release -p wk-status-371tti-net
 .\target\release\wk-status-371tti-net.exe config.yaml
@@ -66,8 +68,14 @@ monitors:
 
 ```text
 status.code 0
-cpu.percent.usage 12.34
-cpu.core.0.percent.usage 14.50
+cpu.core.percent.all 12.34
+cpu.core.percent.0 14.50
+cpu.core.percent.1 10.25
+cpu.core.iowait.all 2.10
+cpu.core.iowait.0 0.40
+network.bytes.rx.unit B/s
+network.bytes.rx.eth0 1250000
+network.bytes.rx.eth1 240000
 network.rx 1250000
 network.tx 2340000
 network.unit bytes/s
@@ -78,7 +86,7 @@ network.unit bytes/s
 
 ## Linux agent
 
-`agent/` はCPU、コア別使用率、I/O wait、メモリ、load average、ネットワークを返すLinux用TCPデーモンです。ネットワークは /proc/net/dev のカウンタ差分を前回要求からの経過秒で割り、インターフェース別に受信・送信bytes/s、packets/s、errors/s、drops/sを記録します。I/O waitはカーネルが公開する値のため目安として扱ってください。ReleaseのLinuxアーカイブにはバイナリとinstallerが含まれます。単体の `.sh` はGitHub Releaseから最新バイナリを取得します。
+`agent/` はLinux用TCPデーモンです。CPU系列は `cpu.core.percent.all` と `cpu.core.percent.<コア番号>`、I/O waitは `cpu.core.iowait.*` にまとめて同じグラフへ表示します。ネットワークも `network.bytes.rx.<interface>` のように出し、方向・値ごとに全インターフェースを同じグラフへ重ねます。VMではゲストOSの `/proc` を使います。LXCなどのコンテナでは環境を検出し、CPU・メモリはcgroup v1/v2の値を優先します。LXCFSの `/proc/stat` が使える場合はコア別CPUも取得します。コンテナ内のload averageやhost-wideなuptimeなど、範囲を特定できない値は出しません。I/O waitはカーネルが公開する値のため目安として扱ってください。ReleaseのLinuxアーカイブにはバイナリとinstallerが含まれます。単体の `.sh` はGitHub Releaseから最新バイナリを取得します。
 
 ```bash
 curl -fL https://github.com/371tti/status.371tti.net/releases/latest/download/wk-status-371tti-net-agent.sh -o install.sh
@@ -88,7 +96,10 @@ sudo bash ./install.sh uninstall
 sudo bash ./install.sh uninstall --purge
 ```
 
-既定ポートは9791です。インストール後に表示されるtokenを使い、監視サーバーにTCP監視を設定します。
+既定ポートは9791です。初回の `install` と以降の `configure` はMonitor ID、表示名、監視サーバーから到達できるagentのIPアドレスを尋ねます。既定ルートのIPを先頭に、検出したネットワーク候補を表示し、手動入力も選べます。NATや別ネットワーク越しの場合は、監視サーバーから実際に到達できるアドレスを選んでください。
+
+設定後はtokenや状態コードの対応を含む完全なTCP monitor entryを表示します。監視サーバーの `config.yaml` の `monitors:` 配下に追加してください。IDは既定で `agent.<hostname>` となり、ドット区切りの先頭部分がグループ名になります。ID、表示名、選択したhostは `configure` の次回実行時にも既定値として保持します。
+
 `configure` ではCPU（コア別・I/O waitを含む）、メモリ、load average、ネットワークの有効・無効を個別に選べます。既定ではすべて有効です。
 
 ```yaml

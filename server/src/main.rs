@@ -7,13 +7,25 @@ mod web;
 use std::{env, error::Error, path::PathBuf};
 
 use crate::{config::AppConfig, monitor::start_tasks, store::Store};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    init_logging();
     if let Err(error) = run().await {
-        eprintln!("wk-status-371tti-net: {error}");
+        error!(error = %error, "server exited with an error");
         std::process::exit(1);
     }
+}
+
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -27,10 +39,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.storage.chunk_minutes,
         config.storage.retention_days,
     )?;
-    println!(
-        "Loaded {} monitor(s) from {}",
-        config.monitors.len(),
-        config_path.display()
+    info!(
+        config_path = %config_path.display(),
+        server_name = %config.server.name,
+        monitor_count = config.monitors.len(),
+        "configuration loaded"
+    );
+    info!(
+        storage_path = %config.storage.path,
+        chunk_minutes = config.storage.chunk_minutes,
+        retention_days = config.storage.retention_days,
+        "history storage ready"
     );
     start_tasks(&config, store.clone());
     web::serve(config, store).await?;

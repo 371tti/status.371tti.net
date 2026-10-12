@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use kurosabi::{http::HttpMethod, server::tokio::KurosabiTokioServerBuilder};
 use minijinja::{Environment, value::Serde};
 use serde::Serialize;
+use tracing::{error, info, warn};
 
 mod charts;
 use self::charts::{
@@ -67,25 +68,49 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
             let state = state.clone();
             async move {
                 let total_count = state.counters.total.fetch_add(1, Ordering::Relaxed) + 1;
+                let path_segments = conn.path_segs();
+                let path: Vec<String> = path_segments
+                    .iter()
+                    .map(|segment| segment.to_string())
+                    .collect();
+                let route = match path.as_slice() {
+                    [root] if root.is_empty() => "dashboard",
+                    [ping] if ping == "ping" => "ping",
+                    [healthz] if healthz == "healthz" => "healthz",
+                    [fonts, font]
+                        if fonts == "fonts"
+                            && (font == "UDEVGothicHSLG-Regular.woff2"
+                                || font == "UDEVGothicHSLG-Bold.woff2") =>
+                    {
+                        "font"
+                    }
+                    [monitors, _] if monitors == "monitors" => "monitor_detail",
+                    _ => "not_found",
+                };
+                info!(
+                    method = ?conn.req.method(),
+                    route,
+                    request_count = total_count,
+                    "HTTP request received"
+                );
                 if conn.req.method() != &HttpMethod::GET {
+                    warn!(
+                        method = ?conn.req.method(),
+                        route,
+                        "HTTP method not allowed"
+                    );
                     return conn.set_status_code(405u16).html_body(error_page(
                         "405 Method Not Allowed",
                         "This request method is not supported.",
                     ));
                 }
 
-                let path_segments = conn.path_segs();
-                let path: Vec<String> = path_segments
-                    .iter()
-                    .map(|segment| segment.to_string())
-                    .collect();
-
                 // Expose only application routes; workspace and configuration files are never served.
                 match path.as_slice() {
                     [root] if root.is_empty() => match dashboard(&state).await {
                         Ok(html) => conn.html_body(html),
                         Err(error) => {
-                            eprintln!("failed to render dashboard: {error}");
+                            error!(error = %error, "failed to render dashboard");
                             conn.set_status_code(500u16).html_body(error_page(
                                 "500 Internal Server Error",
                                 "Failed to load the monitoring dashboard.",
@@ -121,7 +146,7 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                             Ok(Some(html)) => conn.html_body(html),
                             Ok(None) => conn.redirect(NOT_FOUND_REDIRECT),
                             Err(error) => {
-                                eprintln!("failed to render monitor {id}: {error}");
+                                error!(monitor_id = %id, error = %error, "failed to render monitor detail");
                                 conn.set_status_code(500u16).html_body(error_page(
                                     "500 Internal Server Error",
                                     "Failed to load service history.",
@@ -134,7 +159,7 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
             }
         });
 
-    println!("wk-status-371tti-net listening on http://{bind}:{port}");
+    info!(bind = %bind, port, "HTTP server listening");
     server.run().await
 }
 
@@ -602,7 +627,7 @@ async fn monitor_detail(state: &WebState, id: &str) -> io::Result<Option<String>
             .is_some_and(|record| record.tcp_response_truncated),
         history: history
             .iter()
-            .map(|record| history_view(record, monitor.slow_response_threshold_ms))
+            .map(|record| history_view(monitor, record))
             .collect(),
     };
     render("detail.html", &context)
@@ -642,7 +667,7 @@ fn monitor_view(
                         format_timestamp(record.checked_at_ms)
                     ),
                     "—".to_owned(),
-                    record.message.clone(),
+                    public_record_message(monitor, record),
                 )
             } else {
                 (
@@ -651,7 +676,7 @@ fn monitor_view(
                         .latency_ms
                         .map(format_milliseconds)
                         .unwrap_or_else(|| "—".to_owned()),
-                    record.message.clone(),
+                    public_record_message(monitor, record),
                 )
             };
             (
@@ -853,8 +878,122 @@ fn redact_url_query(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_owned())
 }
 
-fn history_view(record: &CheckRecord, threshold_ms: Option<u64>) -> HistoryView {
-    let (status_class, status_label) = record_status(record, threshold_ms);
+fn public_record_message(monitor: &MonitorConfig, record: &CheckRecord) -> String {
+    if record.is_pending {
+        return MONITORING_UNAVAILABLE_MESSAGE.to_owned();
+    }
+
+    if record.is_degraded {
+        let exceeded_latency_threshold =
+            monitor.slow_response_threshold_ms.is_some_and(|threshold| {
+                record
+                    .latency_ms
+                    .is_some_and(|latency| latency > threshold as f64)
+            });
+        return if exceeded_latency_threshold {
+            "Response exceeded slow_ms".to_owned()
+        } else {
+            "Service reported degraded status".to_owned()
+        };
+    }
+
+    if record.is_up {
+        return match &monitor.target {
+            MonitorTarget::Http { .. } => record
+                .status_code
+                .map(|code| format!("HTTP {code}"))
+                .unwrap_or_else(|| "HTTP request succeeded".to_owned()),
+            MonitorTarget::Ping { .. } => "ICMP reply received".to_owned(),
+            MonitorTarget::Tcp { send_message, .. } => {
+                if send_message.is_some() {
+                    if record.tcp_response_truncated {
+                        "TCP exchange succeeded; response capture was truncated".to_owned()
+                    } else {
+                        "TCP exchange succeeded".to_owned()
+                    }
+                } else {
+                    "TCP connection succeeded".to_owned()
+                }
+            }
+        };
+    }
+
+    match &monitor.target {
+        MonitorTarget::Http {
+            accepted_status_codes,
+            ..
+        } => match record.status_code {
+            Some(code)
+                if if accepted_status_codes.is_empty() {
+                    (200..300).contains(&code)
+                } else {
+                    accepted_status_codes.contains(&code)
+                } =>
+            {
+                "HTTP service reported a problem".to_owned()
+            }
+            Some(code) => format!("HTTP {code} was not accepted"),
+            None => "HTTP request failed".to_owned(),
+        },
+        MonitorTarget::Ping { .. } => "Ping check failed".to_owned(),
+        MonitorTarget::Tcp { send_message, .. } => {
+            tcp_failure_message(monitor, record, send_message.is_some())
+        }
+    }
+}
+
+fn tcp_failure_message(monitor: &MonitorConfig, record: &CheckRecord, is_exchange: bool) -> String {
+    let stored = record.message.as_str();
+    if stored.contains("TCP DNS lookup failed") {
+        return "TCP DNS lookup failed".to_owned();
+    }
+    if stored.contains("TCP DNS lookup returned no addresses") {
+        return "TCP DNS lookup returned no addresses".to_owned();
+    }
+    if stored.contains("TCP message send failed") {
+        return "TCP message send failed".to_owned();
+    }
+    if stored.contains("TCP response read failed") {
+        return "TCP response read failed".to_owned();
+    }
+    if stored.contains("TCP response ended before response_end") {
+        return "TCP response ended before response_end".to_owned();
+    }
+    if stored.contains("timed out") {
+        return if is_exchange {
+            "TCP exchange timed out".to_owned()
+        } else {
+            "TCP connection timed out".to_owned()
+        };
+    }
+
+    let is_legacy_tcp_error = stored.contains("TCP exchange with ") && stored.contains(" failed: ")
+        || stored.contains("TCP connection to ") && stored.contains(" failed: ");
+    if is_legacy_tcp_error {
+        return if is_exchange {
+            "TCP exchange failed".to_owned()
+        } else {
+            "TCP connection failed".to_owned()
+        };
+    }
+
+    if record.tcp_response.is_some() {
+        "TCP service reported a problem".to_owned()
+    } else if monitor.slow_response_threshold_ms.is_some_and(|threshold| {
+        record
+            .latency_ms
+            .is_some_and(|latency| latency > threshold as f64)
+    }) {
+        "TCP response exceeded slow_ms".to_owned()
+    } else if is_exchange {
+        "TCP exchange failed".to_owned()
+    } else {
+        "TCP connection failed".to_owned()
+    }
+}
+
+fn history_view(monitor: &MonitorConfig, record: &CheckRecord) -> HistoryView {
+    let (status_class, status_label) = record_status(record, monitor.slow_response_threshold_ms);
     HistoryView {
         checked_at: format_timestamp(record.checked_at_ms),
         status_class: status_class.to_owned(),
@@ -867,7 +1006,7 @@ fn history_view(record: &CheckRecord, threshold_ms: Option<u64>) -> HistoryView 
             .status_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "—".to_owned()),
-        message: record.message.clone(),
+        message: public_record_message(monitor, record),
         tcp_response: record.tcp_response.as_deref().map(format_tcp_response),
         tcp_response_truncated: record.tcp_response_truncated,
     }

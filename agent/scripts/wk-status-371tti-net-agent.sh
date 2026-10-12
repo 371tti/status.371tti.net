@@ -7,6 +7,7 @@ BINARY_NAME="wk-status-371tti-net-agent"
 RELEASE_BINARY_URL="https://github.com/371tti/status.371tti.net/releases/latest/download/${BINARY_NAME}"
 CONFIG_DIR="/etc/${SERVICE_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/agent.env"
+MONITOR_META_FILE="${CONFIG_DIR}/monitor.env"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -15,6 +16,15 @@ WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ORIGINAL_ARGS=("$@")
 TEMP_BINARY=""
 SOURCE_BINARY=""
+MONITOR_ID=""
+MONITOR_NAME=""
+MONITOR_HOST=""
+MONITOR_INTERVAL="60"
+MONITOR_TIMEOUT="5"
+MONITOR_SLOW_MS="500"
+HOST_CANDIDATE_ADDRESSES=()
+HOST_CANDIDATE_LABELS=()
+CONFIGURE_FROM_INSTALL="0"
 
 cleanup() {
   if [[ -n "$TEMP_BINARY" ]]; then
@@ -37,9 +47,9 @@ Usage:
 
 Commands:
   install      Install the bundled or latest Release binary and start the service.
-  configure    Set the listener, access token, and enabled metric groups.
+  configure    Ask for monitor identity/network settings and generate server YAML.
   uninstall    Remove the service and binary; keep configuration by default.
-  --purge      Also remove the configuration and generated token.
+  --purge      Also remove the configuration, generated token, and monitor details.
 EOF
 }
 
@@ -75,6 +85,32 @@ load_config() {
         WS371_AGENT_ENABLE_NETWORK) ENABLE_NETWORK="$value" ;;
       esac
     done < "$CONFIG_FILE"
+  fi
+}
+
+load_monitor_metadata() {
+  local host_slug
+  host_slug="$(hostname -s 2>/dev/null || printf 'agent')"
+  host_slug="$(printf '%s' "$host_slug" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+  [[ -n "$host_slug" ]] || host_slug="agent"
+  MONITOR_ID="agent.${host_slug}"
+  MONITOR_NAME="$(hostname -s 2>/dev/null || printf 'System agent')"
+  MONITOR_HOST=""
+  MONITOR_INTERVAL="60"
+  MONITOR_TIMEOUT="5"
+  MONITOR_SLOW_MS="500"
+
+  if [[ -r "$MONITOR_META_FILE" ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        MONITOR_ID) MONITOR_ID="$value" ;;
+        MONITOR_NAME) MONITOR_NAME="$value" ;;
+        MONITOR_HOST) MONITOR_HOST="$value" ;;
+        MONITOR_INTERVAL) MONITOR_INTERVAL="$value" ;;
+        MONITOR_TIMEOUT) MONITOR_TIMEOUT="$value" ;;
+        MONITOR_SLOW_MS) MONITOR_SLOW_MS="$value" ;;
+      esac
+    done < "$MONITOR_META_FILE"
   fi
 }
 
@@ -116,25 +152,182 @@ prompt_toggle() {
 }
 
 show_monitor_config() {
-  printf '\nUse this TCP monitor configuration on the status server:\n'
-  printf '  type: tcp\n'
-  printf '  host: <agent-host-address>\n'
-  printf '  port: %s\n' "$LISTEN_PORT"
+  local monitor_send
   if [[ -n "$ACCESS_TOKEN" ]]; then
-    printf '  send: "METRICS %s\\n"\n' "$ACCESS_TOKEN"
+    monitor_send="METRICS ${ACCESS_TOKEN}"$'\n'
   else
-    printf '  send: "METRICS\\n"\n'
+    monitor_send="METRICS"$'\n'
   fi
-  printf '  slow_ms: 500\n'
-  printf 'Do not set response_end; the agent closes the connection after the full response.\n'
+
+  printf '\nComplete TCP monitor entry for the status server (paste below monitors:):\n'
+  printf '```yaml\n'
+  printf '  - id: %s\n' "$(yaml_quote "$MONITOR_ID")"
+  printf '    name: %s\n' "$(yaml_quote "$MONITOR_NAME")"
+  printf '    type: tcp\n'
+  printf '    host: %s\n' "$(yaml_quote "$MONITOR_HOST")"
+  printf '    port: %s\n' "$LISTEN_PORT"
+  printf '    interval: %s\n' "$MONITOR_INTERVAL"
+  printf '    timeout: %s\n' "$MONITOR_TIMEOUT"
+  printf '    slow_ms: %s\n' "$MONITOR_SLOW_MS"
+  printf '    hide_target: true\n'
+  printf '    exclude_status: false\n'
+  printf '    send: %s\n' "$(yaml_quote "$monitor_send")"
+  printf '    max_bytes: 16384\n'
+  printf '    response_codes:\n'
+  printf '      0: operational\n'
+  printf '      1: degraded\n'
+  printf '      2: down\n'
+  printf '```\n'
+  printf 'No response_end is set; the agent closes each connection after sending its metrics.\n'
   printf 'Enabled metrics: CPU=%s memory=%s load=%s network=%s\n' \
     "$ENABLE_CPU" "$ENABLE_MEMORY" "$ENABLE_LOAD" "$ENABLE_NETWORK"
+}
+
+yaml_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\t'/\\t}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "$value"
+}
+
+add_host_candidate() {
+  local address="$1"
+  local label="$2"
+  [[ -n "$address" ]] || return 0
+  [[ "$address" =~ ^[0-9A-Fa-f:.]+$ ]] || return 0
+  [[ "$address" == *:* || "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+  case "$address" in
+    0.0.0.0|127.*|169.254.*|::|::1|fe80:*) return 0 ;;
+  esac
+  local existing
+  if ((${#HOST_CANDIDATE_ADDRESSES[@]})); then
+    for existing in "${HOST_CANDIDATE_ADDRESSES[@]}"; do
+      [[ "$existing" == "$address" ]] && return 0
+    done
+  fi
+  HOST_CANDIDATE_ADDRESSES+=("$address")
+  HOST_CANDIDATE_LABELS+=("$label")
+}
+
+is_virtual_interface() {
+  case "$1" in
+    docker*|br-*|veth*|virbr*|podman*|cni*|flannel*|lo) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_host_candidates() {
+  HOST_CANDIDATE_ADDRESSES=()
+  HOST_CANDIDATE_LABELS=()
+
+  if command -v ip >/dev/null 2>&1; then
+    local route_output route_address="" route_interface="" index
+    route_output="$(ip -4 route get 1.1.1.1 2>/dev/null | head -n 1 || true)"
+    local -a route_fields=($route_output)
+    for ((index = 0; index < ${#route_fields[@]}; index++)); do
+      case "${route_fields[$index]}" in
+        src) route_address="${route_fields[$((index + 1))]:-}" ;;
+        dev) route_interface="${route_fields[$((index + 1))]:-}" ;;
+      esac
+    done
+    if [[ -n "$route_address" ]]; then
+      add_host_candidate "$route_address" "default route${route_interface:+ via $route_interface}"
+    fi
+
+    local interface family address rest
+    while read -r _ interface family address rest; do
+      [[ "$family" == "inet" ]] || continue
+      is_virtual_interface "$interface" && continue
+      add_host_candidate "${address%%/*}" "$interface"
+    done < <(ip -o -4 addr show scope global 2>/dev/null || true)
+    while read -r _ interface family address rest; do
+      [[ "$family" == "inet6" ]] || continue
+      is_virtual_interface "$interface" && continue
+      add_host_candidate "${address%%/*}" "$interface"
+    done < <(ip -o -6 addr show scope global 2>/dev/null || true)
+  fi
+
+  if ((${#HOST_CANDIDATE_ADDRESSES[@]} == 0)) && command -v hostname >/dev/null 2>&1; then
+    local address
+    for address in $(hostname -I 2>/dev/null || true); do
+      add_host_candidate "$address" "hostname -I"
+    done
+  fi
+}
+
+validate_monitor_host() {
+  local host="$1"
+  [[ -n "$host" && "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  getent ahosts "$host" >/dev/null 2>&1
+}
+
+choose_monitor_host() {
+  detect_host_candidates
+  printf '\nChoose the address the status server can reach.\n'
+  local default_choice="1" index choice answer
+  [[ -z "$MONITOR_HOST" ]] || default_choice="m"
+  if ((${#HOST_CANDIDATE_ADDRESSES[@]})); then
+    for index in "${!HOST_CANDIDATE_ADDRESSES[@]}"; do
+      printf '  %s) %s (%s)\n' "$((index + 1))" "${HOST_CANDIDATE_ADDRESSES[$index]}" "${HOST_CANDIDATE_LABELS[$index]}"
+      if [[ -n "$MONITOR_HOST" && "$MONITOR_HOST" == "${HOST_CANDIDATE_ADDRESSES[$index]}" ]]; then
+        default_choice="$((index + 1))"
+      fi
+    done
+  else
+    default_choice="m"
+    printf '  No local IP candidates were detected.\n'
+  fi
+  printf '  m) Enter an IP address or DNS name manually\n'
+
+  read -r -p "Host address [${default_choice}]: " choice
+  choice="${choice:-$default_choice}"
+  if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#HOST_CANDIDATE_ADDRESSES[@]})); then
+    MONITOR_HOST="${HOST_CANDIDATE_ADDRESSES[$((choice - 1))]}"
+  elif [[ "${choice,,}" == "m" ]]; then
+    read -r -p "Reachable agent IP or DNS name [${MONITOR_HOST}]: " answer
+    MONITOR_HOST="${answer:-$MONITOR_HOST}"
+    validate_monitor_host "$MONITOR_HOST" || fail "Enter a valid IP address or a DNS name resolvable on this host."
+  else
+    fail "Choose a listed address number or 'm'."
+  fi
+}
+
+prompt_monitor_identity() {
+  local answer
+  read -r -p "Monitor ID (dot-separated group ID) [${MONITOR_ID}]: " answer
+  MONITOR_ID="${answer:-$MONITOR_ID}"
+  [[ "$MONITOR_ID" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$ ]] || fail "Monitor ID must contain dot-separated ASCII letters, digits, '_' or '-'."
+  ((${#MONITOR_ID} <= 128)) || fail "Monitor ID must be 128 characters or fewer."
+
+  read -r -p "Monitor display name [${MONITOR_NAME}]: " answer
+  MONITOR_NAME="${answer:-$MONITOR_NAME}"
+  [[ -n "${MONITOR_NAME//[[:space:]]/}" ]] || fail "Monitor display name must not be empty."
+  if LC_ALL=C grep -q '[[:cntrl:]]' < <(printf '%s' "$MONITOR_NAME"); then
+    fail "Monitor display name must not contain control characters."
+  fi
+}
+
+write_monitor_metadata() {
+  install -d -m 0750 "$CONFIG_DIR"
+  {
+    printf 'MONITOR_ID=%s\n' "$MONITOR_ID"
+    printf 'MONITOR_NAME=%s\n' "$MONITOR_NAME"
+    printf 'MONITOR_HOST=%s\n' "$MONITOR_HOST"
+    printf 'MONITOR_INTERVAL=%s\n' "$MONITOR_INTERVAL"
+    printf 'MONITOR_TIMEOUT=%s\n' "$MONITOR_TIMEOUT"
+    printf 'MONITOR_SLOW_MS=%s\n' "$MONITOR_SLOW_MS"
+  } > "$MONITOR_META_FILE"
+  chmod 0600 "$MONITOR_META_FILE"
 }
 
 configure() {
   require_root "$@"
   require_linux_systemd
   load_config
+  load_monitor_metadata
   local default_token="$ACCESS_TOKEN"
   [[ -n "$default_token" ]] || default_token="$(generate_token)"
 
@@ -152,6 +345,9 @@ configure() {
   prompt_toggle ENABLE_LOAD "Enable load average metrics"
   prompt_toggle ENABLE_NETWORK "Enable per-interface network metrics"
 
+  prompt_monitor_identity
+  choose_monitor_host
+
   validate_configuration
   install -d -m 0750 "$CONFIG_DIR"
   {
@@ -164,12 +360,13 @@ configure() {
     printf 'WS371_AGENT_ENABLE_NETWORK=%s\n' "$ENABLE_NETWORK"
   } > "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
+  write_monitor_metadata
 
   if systemctl cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
     systemctl restart "$SERVICE_NAME.service"
   fi
   printf 'Configuration saved to %s\n' "$CONFIG_FILE"
-  show_monitor_config
+  [[ "$CONFIGURE_FROM_INSTALL" == "1" ]] || show_monitor_config
 }
 
 find_binary() {
@@ -208,8 +405,10 @@ install_service() {
   fi
 
   install -o root -g root -m 0755 "$source_binary" "$INSTALL_PATH"
-  if [[ ! -f "$CONFIG_FILE" ]]; then
+  if [[ ! -f "$CONFIG_FILE" || ! -r "$MONITOR_META_FILE" ]]; then
+    CONFIGURE_FROM_INSTALL="1"
     configure
+    CONFIGURE_FROM_INSTALL="0"
   fi
 
   cat > "$UNIT_FILE" <<'UNIT'
@@ -246,6 +445,7 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now "$SERVICE_NAME.service"
   load_config
+  load_monitor_metadata
   printf 'Installed and started %s.service\n' "$SERVICE_NAME"
   show_monitor_config
 }
@@ -261,7 +461,7 @@ uninstall_service() {
     userdel "$SERVICE_USER" || true
   fi
   if [[ "$purge" == "--purge" ]]; then
-    rm -f "$CONFIG_FILE"
+    rm -f "$CONFIG_FILE" "$MONITOR_META_FILE"
     rmdir "$CONFIG_DIR" 2>/dev/null || true
     printf 'Removed service, binary, and configuration.\n'
   else
