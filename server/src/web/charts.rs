@@ -1,136 +1,169 @@
-use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{format_timestamp, record_status};
+use super::record_status;
 use crate::{http_probe::HttpTimings, store::CheckRecord};
 
-const RESPONSE_CHART_MIN_WIDTH: usize = 908;
-const RESPONSE_CHART_POINT_SPACING: usize = 16;
-const RESPONSE_CHART_EDGE: f64 = 8.0;
-const RESPONSE_CHART_TOP: f64 = 18.0;
-const RESPONSE_CHART_BOTTOM: f64 = 224.0;
-const METRIC_CHART_TOP: f64 = 12.0;
-const METRIC_CHART_BOTTOM: f64 = 126.0;
 const MAX_METRIC_CHARTS: usize = 128;
 const METRIC_SERIES_COLORS: usize = 8;
+
+struct MetricHistory<'a> {
+    records: &'a [CheckRecord],
+    aliases: &'a BTreeMap<String, BTreeSet<String>>,
+}
 
 pub(super) fn response_time_chart(
     history: &[CheckRecord],
     threshold_ms: Option<u64>,
-    average_latency_ms: Option<f64>,
+    include_http_phases: bool,
+    interval_seconds: u64,
+    range_start_ms: i64,
+    range_end_ms: i64,
 ) -> ResponseTimeChart {
-    let chronological: Vec<&CheckRecord> = history.iter().rev().collect();
-    let Some(first) = chronological.first() else {
-        return ResponseTimeChart::default();
-    };
-    let Some(last) = chronological.last() else {
-        return ResponseTimeChart::default();
-    };
-
-    let max_latency = chronological
+    let all_chronological: Vec<&CheckRecord> = history.iter().rev().collect();
+    let (path_start, path_end) = chart_path_range(&all_chronological, range_start_ms, range_end_ms);
+    let chronological = &all_chronological[path_start..path_end];
+    let (_, average_latency_ms) = response_time_stats_for(
+        history
+            .iter()
+            .filter(|record| (range_start_ms..range_end_ms).contains(&record.checked_at_ms)),
+    );
+    let max_latency = all_chronological
         .iter()
+        .filter(|record| (range_start_ms..range_end_ms).contains(&record.checked_at_ms))
         .filter_map(|record| record.latency_ms)
         .filter(|latency| latency.is_finite() && *latency >= 0.0)
         .fold(0.0_f64, f64::max);
-    let has_latency = chronological.iter().any(|record| {
-        record
-            .latency_ms
-            .is_some_and(|latency| latency.is_finite() && latency >= 0.0)
-    });
-    if !has_latency {
-        return ResponseTimeChart::default();
-    }
-
+    let overlay_keys = response_overlay_keys(history);
+    let max_overlay_ms = all_chronological
+        .iter()
+        .filter(|record| (range_start_ms..range_end_ms).contains(&record.checked_at_ms))
+        .flat_map(|record| {
+            overlay_keys
+                .iter()
+                .filter_map(|key| record.metrics.get(key))
+                .copied()
+        })
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .fold(0.0_f64, f64::max);
     let chart_max = max_latency
+        .max(max_overlay_ms)
         .max(average_latency_ms.unwrap_or(0.0))
         .max(threshold_ms.unwrap_or_default() as f64);
     let step = response_chart_step(chart_max);
     let axis_max = step * 4.0;
-    let plot_width = RESPONSE_CHART_MIN_WIDTH
-        .max(chronological.len().saturating_sub(1) * RESPONSE_CHART_POINT_SPACING);
-    let plot_width_f64 = plot_width as f64;
-    let plot_right = plot_width_f64 - RESPONSE_CHART_EDGE;
-    let plot_span = plot_right - RESPONSE_CHART_EDGE;
-    let plot_height = RESPONSE_CHART_BOTTOM - RESPONSE_CHART_TOP;
-    let first_ms = first.checked_at_ms;
-    let span_ms = last.checked_at_ms.saturating_sub(first_ms).max(1) as f64;
-    let x_at = |timestamp_ms: i64| {
-        RESPONSE_CHART_EDGE + (timestamp_ms.saturating_sub(first_ms) as f64 / span_ms) * plot_span
-    };
-    let y_at = |latency_ms: f64| RESPONSE_CHART_BOTTOM - (latency_ms / axis_max) * plot_height;
 
-    let ticks = (0..=4)
-        .map(|index| {
-            let value = axis_max * (4 - index) as f64 / 4.0;
-            let y = RESPONSE_CHART_TOP + plot_height * index as f64 / 4.0;
-            ResponseChartTick {
-                y: chart_coordinate(y),
-                label_y: chart_coordinate(y + 4.0),
-                value: format_chart_number(value),
+    let mut data_point_count = 0;
+    let mut has_phase_data = false;
+    let mut response_data = Vec::with_capacity(chronological.len());
+    let mut phase_data: Option<[Vec<serde_json::Value>; 4]> = include_http_phases
+        .then(|| std::array::from_fn(|_| Vec::with_capacity(chronological.len())));
+    let mut previous_timestamp_ms = None;
+    let max_gap_ms = interval_seconds.saturating_mul(2000).min(i64::MAX as u64) as i64;
+    for record in chronological {
+        if let Some(previous) = previous_timestamp_ms {
+            let gap = record.checked_at_ms.saturating_sub(previous);
+            if gap > max_gap_ms {
+                let gap_timestamp_ms = previous.saturating_add(gap / 2);
+                response_data.push(json!({ "x": gap_timestamp_ms, "y": null }));
+                if let Some(phase_data) = &mut phase_data {
+                    for phase in phase_data {
+                        phase.push(json!({ "x": gap_timestamp_ms, "y": null }));
+                    }
+                }
             }
-        })
-        .collect();
-
-    let mut points = Vec::new();
-    let mut line_paths = Vec::new();
-    let mut current_path = String::new();
-    for record in &chronological {
+        }
         let latency = record
             .latency_ms
             .filter(|latency| latency.is_finite() && *latency >= 0.0);
-        let Some(latency) = latency else {
-            if !current_path.is_empty() {
-                line_paths.push(ResponseChartLine {
-                    path_data: std::mem::take(&mut current_path),
-                });
-            }
-            continue;
-        };
-
-        let x = x_at(record.checked_at_ms);
-        let y = y_at(latency);
-        if current_path.is_empty() {
-            current_path = format!("M {} {}", chart_coordinate(x), chart_coordinate(y));
+        let http_timing = if include_http_phases {
+            record.http_timings.as_ref().map(http_timing_view)
         } else {
-            current_path.push_str(&format!(
-                " L {} {}",
-                chart_coordinate(x),
-                chart_coordinate(y)
-            ));
+            None
+        };
+        let phase_values = if include_http_phases {
+            record.http_timings.as_ref().and_then(chart_phase_values)
+        } else {
+            None
+        };
+        has_phase_data |= phase_values.is_some();
+        if latency.is_some() && (range_start_ms..range_end_ms).contains(&record.checked_at_ms) {
+            data_point_count += 1;
         }
-        points.push(ResponseChartPoint {
-            x: chart_coordinate(x),
-            y: chart_coordinate(y),
-            status_class: record_status(record, threshold_ms).0.to_owned(),
-            checked_at: format_timestamp(record.checked_at_ms),
-            aria_label: format!(
-                "{} · Last response time: {} · {} · Select to view timing breakdown",
-                format_timestamp(record.checked_at_ms),
-                format_milliseconds(latency),
-                record_status(record, threshold_ms).1
-            ),
-            http_timing: record.http_timings.as_ref().map(http_timing_view),
-            phase_segments: record
-                .http_timings
-                .as_ref()
-                .and_then(chart_phase_values)
-                .map(|values| response_chart_phase_segments(x, values, &y_at))
-                .unwrap_or_default(),
-        });
-    }
-    if !current_path.is_empty() {
-        line_paths.push(ResponseChartLine {
-            path_data: current_path,
-        });
+        response_data.push(json!({
+            "x": record.checked_at_ms,
+            "y": latency,
+            "statusClass": record_status(record, threshold_ms).0,
+            "inRange": (range_start_ms..range_end_ms).contains(&record.checked_at_ms),
+            "httpTiming": http_timing,
+        }));
+        if let Some(phase_data) = &mut phase_data {
+            for (index, phase) in phase_data.iter_mut().enumerate() {
+                phase.push(json!({
+                    "x": record.checked_at_ms,
+                    "y": phase_values.map(|values| values[index]),
+                }));
+            }
+        }
+        previous_timestamp_ms = Some(record.checked_at_ms);
     }
 
-    let average_y = average_latency_ms.map(|average| chart_coordinate(y_at(average)));
-    let threshold_y = threshold_ms.and_then(|threshold| {
-        let threshold = threshold as f64;
-        (threshold <= axis_max).then(|| chart_coordinate(y_at(threshold)))
+    let mut datasets = vec![
+        json!({ "label": "Response", "kind": "line", "colorIndex": 0, "data": response_data }),
+    ];
+    if let Some(phase_data) = phase_data.as_ref().filter(|_| has_phase_data) {
+        datasets.extend([
+            json!({ "label": "DNS", "kind": "bar", "colorIndex": 1, "data": phase_data[0] }),
+            json!({ "label": "TCP", "kind": "bar", "colorIndex": 2, "data": phase_data[1] }),
+            json!({ "label": "TLS", "kind": "bar", "colorIndex": 3, "data": phase_data[2] }),
+            json!({ "label": "HTTP", "kind": "bar", "colorIndex": 4, "data": phase_data[3] }),
+        ]);
+    }
+    for (index, key) in overlay_keys.iter().enumerate() {
+        let mut data = Vec::with_capacity(chronological.len());
+        let mut previous_timestamp_ms = None;
+        for record in chronological {
+            if let Some(previous) = previous_timestamp_ms {
+                let gap = record.checked_at_ms.saturating_sub(previous);
+                if gap > max_gap_ms {
+                    data.push(json!({
+                        "x": previous.saturating_add(gap / 2),
+                        "y": null,
+                    }));
+                }
+            }
+            let mut point = json!({
+                "x": record.checked_at_ms,
+                "y": record.metrics.get(key).filter(|value| value.is_finite()),
+            });
+            if !(range_start_ms..range_end_ms).contains(&record.checked_at_ms) {
+                point["inRange"] = json!(false);
+            }
+            data.push(point);
+            previous_timestamp_ms = Some(record.checked_at_ms);
+        }
+        datasets.push(json!({
+            "label": key.strip_prefix("response.").unwrap_or(key),
+            "key": key.strip_prefix("response.").unwrap_or(key),
+            "kind": "overlay",
+            "colorIndex": (index + 1) % METRIC_SERIES_COLORS,
+            "unit": "ms",
+            "data": data,
+        }));
+    }
+
+    let chart_data = json!({
+        "kind": "response",
+        "xMin": range_start_ms,
+        "xMax": range_end_ms,
+        "yMin": 0.0,
+        "yMax": axis_max,
+        "average": average_latency_ms,
+        "threshold": threshold_ms.map(|threshold| threshold as f64),
+        "datasets": datasets
     });
-    let phase_description = if points.iter().any(|point| !point.phase_segments.is_empty()) {
+    let phase_description = if has_phase_data {
         "Stacked bars show the DNS, TCP, TLS, and HTTP breakdown."
     } else {
         ""
@@ -139,39 +172,42 @@ pub(super) fn response_time_chart(
         aria_label: format!(
             "Response time trend. {}X axis: check time. Y axis: milliseconds. Average response time: {}. Slow response threshold: {}. {} data points.",
             phase_description,
-            format_milliseconds(average_latency_ms.unwrap_or_default()),
+            average_latency_ms
+                .map(format_milliseconds)
+                .unwrap_or_else(|| "not available".to_owned()),
             threshold_ms
                 .map(|threshold| format_milliseconds(threshold as f64))
                 .unwrap_or_else(|| "disabled".to_owned()),
-            points.len(),
+            data_point_count,
         ),
-        start_label: format_chart_timestamp(first_ms),
-        end_label: format_chart_timestamp(last.checked_at_ms),
-        start_timestamp_ms: first_ms,
-        end_timestamp_ms: last.checked_at_ms,
-        plot_width,
-        average_y,
-        threshold_y,
-        threshold_label: threshold_ms
-            .map(|threshold| format_chart_number(threshold as f64))
-            .unwrap_or_default(),
-        ticks,
-        line_paths,
-        points,
+        data_point_count,
+        chart_data,
     }
 }
 
-pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
+pub(super) fn metric_graphs(
+    history: &[CheckRecord],
+    interval_seconds: u64,
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> Vec<MetricGroupView> {
     let mut keys = BTreeSet::new();
+    let mut metric_aliases = BTreeMap::<String, BTreeSet<String>>::new();
     for record in history {
         for key in record.metrics.keys() {
-            keys.insert(canonical_metric_key(key));
-            if keys.len() == MAX_METRIC_CHARTS {
-                break;
+            if is_response_overlay_key(key) {
+                continue;
             }
-        }
-        if keys.len() == MAX_METRIC_CHARTS {
-            break;
+            let canonical_key = canonical_metric_key(key);
+            if keys.len() < MAX_METRIC_CHARTS || keys.contains(&canonical_key) {
+                keys.insert(canonical_key.clone());
+                if canonical_key != *key {
+                    metric_aliases
+                        .entry(canonical_key)
+                        .or_default()
+                        .insert(key.clone());
+                }
+            }
         }
     }
 
@@ -185,6 +221,10 @@ pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
         }
     }
 
+    let metric_history = MetricHistory {
+        records: history,
+        aliases: &metric_aliases,
+    };
     let mut groups = BTreeMap::<String, Vec<MetricChartView>>::new();
     for (name, mut keys) in grouped_keys {
         keys.sort_by(|left, right| {
@@ -205,13 +245,29 @@ pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
             }
         });
         let unit = latest_metric_unit(&name, history);
-        if let Some(chart) = metric_chart(&name, &keys, history, &unit) {
+        if let Some(chart) = metric_chart(
+            &name,
+            &keys,
+            &metric_history,
+            &unit,
+            interval_seconds,
+            range_start_ms,
+            range_end_ms,
+        ) {
             groups.entry(name).or_default().push(chart);
         }
     }
     for key in standalone_keys {
         let unit = latest_metric_unit("Metrics", history);
-        if let Some(chart) = metric_chart("Metrics", std::slice::from_ref(&key), history, &unit) {
+        if let Some(chart) = metric_chart(
+            "Metrics",
+            std::slice::from_ref(&key),
+            &metric_history,
+            &unit,
+            interval_seconds,
+            range_start_ms,
+            range_end_ms,
+        ) {
             groups.entry("Metrics".to_owned()).or_default().push(chart);
         }
     }
@@ -222,7 +278,20 @@ pub(super) fn metric_graphs(history: &[CheckRecord]) -> Vec<MetricGroupView> {
             let unit = latest_metric_unit(&name, history);
             MetricGroupView { name, unit, charts }
         })
+        .collect::<Vec<_>>()
+}
+
+fn response_overlay_keys(history: &[CheckRecord]) -> BTreeSet<String> {
+    history
+        .iter()
+        .flat_map(|record| record.metrics.keys())
+        .filter(|key| is_response_overlay_key(key))
+        .cloned()
         .collect()
+}
+
+fn is_response_overlay_key(key: &str) -> bool {
+    key.starts_with("response.") && key != "response.ms"
 }
 
 fn latest_metric_unit(group: &str, history: &[CheckRecord]) -> String {
@@ -244,19 +313,22 @@ fn latest_metric_unit(group: &str, history: &[CheckRecord]) -> String {
 fn metric_chart(
     group: &str,
     keys: &[String],
-    history: &[CheckRecord],
+    history: &MetricHistory<'_>,
     unit: &str,
+    interval_seconds: u64,
+    range_start_ms: i64,
+    range_end_ms: i64,
 ) -> Option<MetricChartView> {
-    let chronological: Vec<&CheckRecord> = history.iter().rev().collect();
-    let first = chronological.first()?;
-    let last = chronological.last()?;
+    let chronological_all: Vec<&CheckRecord> = history.records.iter().rev().collect();
+    let (path_start, path_end) = chart_path_range(&chronological_all, range_start_ms, range_end_ms);
+    let chronological = &chronological_all[path_start..path_end];
     let metric_keys: Vec<&str> = keys
         .iter()
         .map(String::as_str)
         .filter(|key| {
-            chronological
-                .iter()
-                .any(|record| metric_value(record, key).is_some_and(|value| value.is_finite()))
+            chronological_all.iter().any(|record| {
+                metric_value(record, key, history.aliases).is_some_and(|value| value.is_finite())
+            })
         })
         .collect();
     if metric_keys.is_empty() {
@@ -266,101 +338,51 @@ fn metric_chart(
     let mut minimum = f64::INFINITY;
     let mut maximum = f64::NEG_INFINITY;
     for key in &metric_keys {
-        for record in &chronological {
-            if let Some(value) = metric_value(record, key).filter(|value| value.is_finite()) {
+        for record in &chronological_all {
+            if let Some(value) =
+                metric_value(record, key, history.aliases).filter(|value| value.is_finite())
+            {
                 minimum = minimum.min(*value);
                 maximum = maximum.max(*value);
             }
         }
     }
-    let spread = maximum - minimum;
-    let padding = if spread == 0.0 {
-        maximum.abs().max(1.0) * 0.08
-    } else {
-        spread * 0.08
-    };
-    let axis_min = minimum - padding;
-    let axis_max = maximum + padding;
-    let plot_width = RESPONSE_CHART_MIN_WIDTH
-        .max(chronological.len().saturating_sub(1) * RESPONSE_CHART_POINT_SPACING);
-    let plot_span = plot_width as f64 - 2.0 * RESPONSE_CHART_EDGE;
-    let plot_height = METRIC_CHART_BOTTOM - METRIC_CHART_TOP;
-    let first_ms = first.checked_at_ms;
-    let span_ms = last.checked_at_ms.saturating_sub(first_ms).max(1) as f64;
-    let x_at = |timestamp_ms: i64| {
-        RESPONSE_CHART_EDGE + (timestamp_ms.saturating_sub(first_ms) as f64 / span_ms) * plot_span
-    };
-    let y_at = |value: f64| {
-        METRIC_CHART_BOTTOM - ((value - axis_min) / (axis_max - axis_min)) * plot_height
-    };
-    let ticks = (0..=4)
-        .map(|index| {
-            let fraction = (4 - index) as f64 / 4.0;
-            let value = axis_min + (axis_max - axis_min) * fraction;
-            let y = METRIC_CHART_TOP + plot_height * index as f64 / 4.0;
-            MetricChartTick {
-                y: chart_coordinate(y),
-                label_y: chart_coordinate(y + 4.0),
-                value: format_chart_number(value),
-            }
-        })
-        .collect();
-
-    let mut series = Vec::with_capacity(metric_keys.len());
+    let (axis_min, axis_max) = metric_axis_bounds(minimum, maximum);
+    let mut chart_datasets = Vec::with_capacity(metric_keys.len());
     for (series_index, key) in metric_keys.into_iter().enumerate() {
         let color_index = series_index % METRIC_SERIES_COLORS;
-        let mut points = Vec::new();
-        let mut line_paths = Vec::new();
-        let mut current_path = String::new();
-        for record in &chronological {
-            let Some(value) = metric_value(record, key).filter(|value| value.is_finite()) else {
-                if !current_path.is_empty() {
-                    line_paths.push(MetricChartLine {
-                        path_data: std::mem::take(&mut current_path),
-                    });
+        let mut chart_data = Vec::with_capacity(chronological.len());
+        let mut previous_chart_timestamp_ms = None;
+        let max_gap_ms = interval_seconds.saturating_mul(2000).min(i64::MAX as u64) as i64;
+        for record in chronological {
+            if let Some(previous) = previous_chart_timestamp_ms {
+                let gap = record.checked_at_ms.saturating_sub(previous);
+                if gap > max_gap_ms {
+                    chart_data.push(json!({
+                        "x": previous.saturating_add(gap / 2),
+                        "y": null,
+                    }));
                 }
-                continue;
-            };
-            let x = x_at(record.checked_at_ms);
-            let y = y_at(*value);
-            if current_path.is_empty() {
-                current_path = format!("M {} {}", chart_coordinate(x), chart_coordinate(y));
-            } else {
-                current_path.push_str(&format!(
-                    " L {} {}",
-                    chart_coordinate(x),
-                    chart_coordinate(y)
-                ));
             }
-            let checked_at = format_timestamp(record.checked_at_ms);
-            let formatted_value = format_chart_number(*value);
-            let display_value = if unit.is_empty() {
-                formatted_value
-            } else {
-                format!("{formatted_value} {unit}")
-            };
-            points.push(MetricChartPoint {
-                x: chart_coordinate(x),
-                y: chart_coordinate(y),
-                color_index,
-                timestamp_ms: record.checked_at_ms,
-                checked_at: checked_at.clone(),
-                value: display_value.clone(),
-                aria_label: format!("{checked_at} · {key}: {display_value}"),
+            previous_chart_timestamp_ms = Some(record.checked_at_ms);
+            let value =
+                metric_value(record, key, history.aliases).filter(|value| value.is_finite());
+            let mut point = json!({
+                "x": record.checked_at_ms,
+                "y": value,
             });
+            if !(range_start_ms..range_end_ms).contains(&record.checked_at_ms) {
+                point["inRange"] = json!(false);
+            }
+            chart_data.push(point);
         }
-        if !current_path.is_empty() {
-            line_paths.push(MetricChartLine {
-                path_data: current_path,
-            });
-        }
-        series.push(MetricChartSeries {
-            key: key.to_owned(),
-            label: key.rsplit('.').next().unwrap_or(key).to_owned(),
-            color_index,
-            line_paths,
-            points,
-        });
+        chart_datasets.push(json!({
+            "label": key.rsplit('.').next().unwrap_or(key),
+            "key": key,
+            "unit": unit,
+            "colorIndex": color_index,
+            "data": chart_data,
+        }));
     }
 
     let unit_description = if unit.is_empty() {
@@ -368,18 +390,68 @@ fn metric_chart(
     } else {
         format!(" ({unit})")
     };
+    let chart_data = json!({
+        "kind": "metric",
+        "xMin": range_start_ms,
+        "xMax": range_end_ms,
+        "yMin": axis_min,
+        "yMax": axis_max,
+        "datasets": chart_datasets,
+    });
     Some(MetricChartView {
         aria_label: format!(
             "{group}{unit_description} metrics trend with a shared vertical scale; each colored line represents one metric"
         ),
-        start_label: format_chart_timestamp(first_ms),
-        end_label: format_chart_timestamp(last.checked_at_ms),
-        start_timestamp_ms: first_ms,
-        end_timestamp_ms: last.checked_at_ms,
-        plot_width,
-        ticks,
-        series,
+        chart_data,
     })
+}
+
+fn metric_axis_bounds(minimum: f64, maximum: f64) -> (f64, f64) {
+    let spread = maximum - minimum;
+    let scale = if spread.is_finite() && spread > 0.0 {
+        spread
+    } else {
+        minimum.abs().max(maximum.abs())
+    };
+    if scale == 0.0 {
+        return (0.0, 1.0);
+    }
+
+    let step = nice_chart_step(scale / 4.0);
+    if !step.is_finite() || step <= 0.0 {
+        return (minimum, maximum);
+    }
+
+    let mut axis_min = (minimum / step).floor() * step;
+    let mut axis_max = (maximum / step).ceil() * step;
+    if axis_min == axis_max {
+        axis_min -= step;
+        axis_max += step;
+        if minimum >= 0.0 && axis_min < 0.0 {
+            axis_min = 0.0;
+        }
+    }
+
+    if !axis_min.is_finite() || !axis_max.is_finite() || axis_min >= axis_max {
+        (minimum, maximum)
+    } else {
+        (axis_min, axis_max)
+    }
+}
+
+fn chart_path_range(
+    chronological: &[&CheckRecord],
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> (usize, usize) {
+    let first_in_range =
+        chronological.partition_point(|record| record.checked_at_ms < range_start_ms);
+    let first_after_range =
+        chronological.partition_point(|record| record.checked_at_ms < range_end_ms);
+    (
+        first_in_range.saturating_sub(1),
+        first_after_range.saturating_add(1).min(chronological.len()),
+    )
 }
 
 fn canonical_metric_key(key: &str) -> String {
@@ -389,14 +461,14 @@ fn canonical_metric_key(key: &str) -> String {
         _ => {}
     }
     if let Some(rest) = key.strip_prefix("cpu.core.") {
-        if let Some((core, metric)) = rest.split_once(".percent.") {
-            if core.bytes().all(|byte| byte.is_ascii_digit()) {
-                return match metric {
-                    "usage" => format!("cpu.percent.{core}"),
-                    "iowait" => format!("cpu.iowait.{core}"),
-                    _ => key.to_owned(),
-                };
-            }
+        if let Some((core, metric)) = rest.split_once(".percent.")
+            && core.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return match metric {
+                "usage" => format!("cpu.percent.{core}"),
+                "iowait" => format!("cpu.iowait.{core}"),
+                _ => key.to_owned(),
+            };
         }
         if rest.starts_with("percent.") || rest.starts_with("iowait.") {
             return format!("cpu.{rest}");
@@ -413,12 +485,16 @@ fn canonical_metric_key(key: &str) -> String {
     key.to_owned()
 }
 
-fn metric_value<'a>(record: &'a CheckRecord, canonical_key: &str) -> Option<&'a f64> {
+fn metric_value<'a>(
+    record: &'a CheckRecord,
+    canonical_key: &str,
+    metric_aliases: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<&'a f64> {
     record.metrics.get(canonical_key).or_else(|| {
-        record
-            .metrics
+        metric_aliases
+            .get(canonical_key)?
             .iter()
-            .find_map(|(key, value)| (canonical_metric_key(key) == canonical_key).then_some(value))
+            .find_map(|alias| record.metrics.get(alias))
     })
 }
 
@@ -437,22 +513,20 @@ fn canonical_metric_unit_groups(group: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect();
     }
-    if let Some(rest) = group.strip_prefix("cpu.core.") {
-        if let Some((core, metric)) = rest.split_once('.') {
-            if core.bytes().all(|byte| byte.is_ascii_digit())
-                && matches!(metric, "percent" | "iowait")
-            {
-                return [
-                    "cpu.percent",
-                    "cpu.iowait",
-                    "cpu.core.percent",
-                    "cpu.core.iowait",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-            }
-        }
+    if let Some(rest) = group.strip_prefix("cpu.core.")
+        && let Some((core, metric)) = rest.split_once('.')
+        && core.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(metric, "percent" | "iowait")
+    {
+        return [
+            "cpu.percent",
+            "cpu.iowait",
+            "cpu.core.percent",
+            "cpu.core.iowait",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     }
     let parts = group.split('.').collect::<Vec<_>>();
     if parts.len() == 3
@@ -468,11 +542,17 @@ fn canonical_metric_unit_groups(group: &str) -> Vec<String> {
 }
 
 pub(super) fn response_time_stats(history: &[CheckRecord]) -> (ResponseTimeStats, Option<f64>) {
+    response_time_stats_for(history.iter())
+}
+
+fn response_time_stats_for<'a>(
+    history: impl IntoIterator<Item = &'a CheckRecord>,
+) -> (ResponseTimeStats, Option<f64>) {
     let mut count = 0usize;
     let mut total_ms = 0.0_f64;
     let mut maximum_ms = 0.0_f64;
     for latency in history
-        .iter()
+        .into_iter()
         .filter_map(|record| record.latency_ms)
         .filter(|latency| latency.is_finite() && *latency >= 0.0)
     {
@@ -503,6 +583,10 @@ pub(super) fn response_time_stats(history: &[CheckRecord]) -> (ResponseTimeStats
 
 fn response_chart_step(max_latency_ms: f64) -> f64 {
     let rough_step = (max_latency_ms / 4.0).max(0.01);
+    nice_chart_step(rough_step)
+}
+
+fn nice_chart_step(rough_step: f64) -> f64 {
     let magnitude = 10_f64.powf(rough_step.log10().floor());
     let normalized = rough_step / magnitude;
     let nice_step = if normalized <= 1.0 {
@@ -517,14 +601,6 @@ fn response_chart_step(max_latency_ms: f64) -> f64 {
         10.0
     };
     nice_step * magnitude
-}
-
-fn chart_coordinate(value: f64) -> String {
-    format!("{value:.2}")
-}
-
-fn format_chart_number(value: f64) -> String {
-    format_si_number(value, 6)
 }
 
 fn format_si_number(value: f64, fractional_digits_below_1000: usize) -> String {
@@ -585,12 +661,6 @@ pub(super) fn format_milliseconds(value: f64) -> String {
     format!("{} ms", format_si_number(value, 1))
 }
 
-pub(super) fn format_chart_timestamp(timestamp_ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
-        .map(|date| date.format("%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "—".to_owned())
-}
-
 fn chart_phase_values(timings: &HttpTimings) -> Option<[f64; 4]> {
     let dns = if timings.dns_lookup_attempted {
         timings.dns_ms?
@@ -609,33 +679,6 @@ fn chart_phase_values(timings: &HttpTimings) -> Option<[f64; 4]> {
         .iter()
         .all(|value| value.is_finite() && *value >= 0.0)
         .then_some(values)
-}
-
-fn response_chart_phase_segments(
-    x: f64,
-    phase_values: [f64; 4],
-    y_at: &impl Fn(f64) -> f64,
-) -> Vec<ResponseChartPhaseSegment> {
-    let phases = ["dns", "tcp", "tls", "http"];
-    let mut elapsed_ms = 0.0;
-    phase_values
-        .into_iter()
-        .zip(phases)
-        .filter_map(|(phase_ms, phase)| {
-            let previous_ms = elapsed_ms;
-            elapsed_ms += phase_ms;
-            let y = y_at(elapsed_ms);
-            let bottom_y = y_at(previous_ms);
-            let height = bottom_y - y;
-            (height > 0.0).then(|| ResponseChartPhaseSegment {
-                x: chart_coordinate(x - 3.5),
-                y: chart_coordinate(y),
-                width: "7".to_owned(),
-                height: chart_coordinate(height),
-                phase: phase.to_owned(),
-            })
-        })
-        .collect()
 }
 
 pub(super) fn http_timing_view(timings: &HttpTimings) -> HttpTimingView {
@@ -662,26 +705,6 @@ pub(super) fn format_timing(value: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_owned())
 }
 
-pub(super) fn format_http_timing_summary(timings: &HttpTimings) -> String {
-    let dns = if timings.dns_lookup_attempted {
-        format_timing(timings.dns_ms)
-    } else {
-        "Not needed".to_owned()
-    };
-    let tls = if timings.tls_handshake_attempted {
-        format_timing(timings.tls_handshake_ms)
-    } else {
-        "Not applicable".to_owned()
-    };
-    format!(
-        "DNS {} · TCP {} · TLS {} · HTTP {}",
-        dns,
-        format_timing(timings.tcp_connect_ms),
-        tls,
-        format_timing(timings.request_to_headers_ms),
-    )
-}
-
 #[derive(Serialize)]
 pub(super) struct ResponseTimeStats {
     average: String,
@@ -698,54 +721,15 @@ pub(super) struct HttpTimingView {
 }
 
 #[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ResponseTimeChart {
     aria_label: String,
-    start_label: String,
-    end_label: String,
-    start_timestamp_ms: i64,
-    end_timestamp_ms: i64,
-    plot_width: usize,
-    average_y: Option<String>,
-    threshold_y: Option<String>,
-    threshold_label: String,
-    ticks: Vec<ResponseChartTick>,
-    line_paths: Vec<ResponseChartLine>,
-    points: Vec<ResponseChartPoint>,
+    data_point_count: usize,
+    chart_data: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct ResponseChartTick {
-    y: String,
-    label_y: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct ResponseChartLine {
-    path_data: String,
-}
-
-#[derive(Serialize)]
-struct ResponseChartPoint {
-    x: String,
-    y: String,
-    status_class: String,
-    checked_at: String,
-    aria_label: String,
-    http_timing: Option<HttpTimingView>,
-    phase_segments: Vec<ResponseChartPhaseSegment>,
-}
-
-#[derive(Serialize)]
-struct ResponseChartPhaseSegment {
-    x: String,
-    y: String,
-    width: String,
-    height: String,
-    phase: String,
-}
-
-#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct MetricGroupView {
     name: String,
     unit: String,
@@ -753,45 +737,8 @@ pub(super) struct MetricGroupView {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MetricChartView {
     aria_label: String,
-    start_label: String,
-    end_label: String,
-    start_timestamp_ms: i64,
-    end_timestamp_ms: i64,
-    plot_width: usize,
-    ticks: Vec<MetricChartTick>,
-    series: Vec<MetricChartSeries>,
-}
-
-#[derive(Serialize)]
-struct MetricChartSeries {
-    key: String,
-    label: String,
-    color_index: usize,
-    line_paths: Vec<MetricChartLine>,
-    points: Vec<MetricChartPoint>,
-}
-
-#[derive(Serialize)]
-struct MetricChartTick {
-    y: String,
-    label_y: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct MetricChartLine {
-    path_data: String,
-}
-
-#[derive(Serialize)]
-struct MetricChartPoint {
-    x: String,
-    y: String,
-    color_index: usize,
-    timestamp_ms: i64,
-    checked_at: String,
-    value: String,
-    aria_label: String,
+    chart_data: serde_json::Value,
 }

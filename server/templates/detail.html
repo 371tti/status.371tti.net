@@ -1,43 +1,60 @@
 {% extends "base.html" %}
 {% block content %}
-<p class="breadcrumb"><a href="/">Services</a> / {{ monitor.name }}</p>
-<section class="page-heading detail-heading">
+<p class="breadcrumb">{{ monitor.id }}</p>
+<section class="page-heading detail-heading" data-status-update-url="{{ status_data_url }}">
   <div>
     <h1>{{ monitor.name }}</h1>
     {% if monitor.show_target %}
     <p class="lede target-text">{{ monitor.target }}</p>
     {% endif %}
   </div>
-  <span class="status {{ monitor.status_class }} status-large">{{ monitor.status_label }}</span>
+  <span class="status {{ monitor.status_class }} status-large" data-live-monitor-status>{{ monitor.status_label }}</span>
 </section>
 
 <section class="summary-grid detail-summary" aria-label="Service overview">
-  <div class="summary-item"><span>Last Response</span><strong>{{ monitor.response_time }}</strong></div>
-  <div class="summary-item"><span>{{ monitor.normal_label }}</span><strong>{{ monitor.normal_percent }}</strong></div>
+  <div class="summary-item"><span>Last Response</span><strong data-live-response-time>{{ monitor.response_time }}</strong></div>
+  <div class="summary-item"><span data-live-normal-label>{{ monitor.normal_label }}</span><strong data-live-normal-percent>{{ monitor.normal_percent }}</strong></div>
   <div class="summary-item"><span>Interval</span><strong>{{ monitor.interval_seconds }}s</strong></div>
-  <div class="summary-item"><span>Checked</span><strong class="small-strong">{{ monitor.last_checked }}</strong></div>
+  <div class="summary-item"><span>Checked</span><strong class="small-strong" data-live-last-checked>{{ monitor.last_checked }}</strong></div>
 </section>
 
 <section class="detail-panel uptime-panel">
   <h2>Uptime</h2>
   {% if monitor.uptime_bar %}
-  <div class="uptime-bar uptime-bar-large" role="group" aria-label="{{ monitor.uptime_bar_label }}">
-    {% for segment in monitor.uptime_bar %}<span class="uptime-segment {{ segment.status_class }}" title="{{ segment.title }}" tabindex="0" role="img" aria-label="{{ segment.title }}"></span>{% endfor %}
+  <div class="uptime-bar-view">
+    <h3>By period</h3>
+    <div class="uptime-bar uptime-bar-large" role="group" aria-label="{{ monitor.uptime_bar_label }}" data-uptime-bar="overview">
+      {% for segment in monitor.uptime_bar %}<span class="uptime-segment {{ segment.status_class }}" title="{{ segment.title }}" tabindex="0" role="img" aria-label="{{ segment.title }}"></span>{% endfor %}
+    </div>
+    <div class="uptime-bar-axis" aria-hidden="true"><span data-uptime-start>{{ monitor.uptime_bar_start_label }}</span><span data-uptime-end>{{ monitor.uptime_bar_end_label }}</span></div>
   </div>
-  <div class="uptime-bar-axis" aria-hidden="true"><span>{{ monitor.uptime_bar_start_label }}</span><span>{{ monitor.uptime_bar_end_label }}</span></div>
+  <div class="uptime-bar-view">
+    <h3>Recent checks <span>{{ recent_checks_count_label }}</span></h3>
+    <div class="uptime-bar uptime-bar-large" role="group" aria-label="{{ recent_checks_bar_label }}" data-uptime-bar="checks">
+      {% for segment in recent_checks_bar %}<span class="uptime-segment {{ segment.status_class }}" title="{{ segment.title }}" tabindex="0" role="img" aria-label="{{ segment.title }}"></span>{% endfor %}
+    </div>
+    <div class="uptime-bar-axis" aria-hidden="true"><span data-uptime-start>{{ recent_checks_bar_start_label }}</span><span data-uptime-end>{{ recent_checks_bar_end_label }}</span></div>
+  </div>
   {% endif %}
 </section>
 
-<section class="detail-panel response-time-panel">
+<section class="detail-panel response-time-panel" data-chart-data-url="{{ chart_data_url }}" data-retention-start-ms="{{ chart_retention_start_ms }}" data-window-end-ms="{{ chart_window_end_ms }}">
   <div class="response-chart-heading">
-    <h2>Recent Response Times</h2>
+    <h2>Response Times</h2>
     <span>ms</span>
   </div>
   <div class="response-time-stats" aria-label="Response time statistics">
-    <div><span>Average</span><strong>{{ response_time_stats.average }}</strong></div>
-    <div><span>Maximum</span><strong>{{ response_time_stats.maximum }}</strong></div>
+    <div><span>Average</span><strong data-response-stat="average">{{ response_time_stats.average }}</strong></div>
+    <div><span>Maximum</span><strong data-response-stat="maximum">{{ response_time_stats.maximum }}</strong></div>
     <div><span>Threshold</span><strong>{{ monitor.response_threshold_label }}</strong></div>
   </div>
+  <div class="chart-day-controls">
+    <label>Date (JST) <input type="date" data-chart-day></label>
+    <button type="button" data-day-previous>&lt;- Previous day</button>
+    <button type="button" data-day-next>Next day -&gt;</button>
+    <button type="button" data-chart-reset-zoom>Reset zoom</button>
+  </div>
+  <p class="chart-load-error" data-chart-load-error role="status" hidden></p>
   {% if is_http_monitor %}
   <div class="http-phase-timings" data-http-phase-timings aria-label="Timing breakdown from a new connection to response headers">
     <p class="http-phase-timing-selection" aria-live="polite">
@@ -50,134 +67,28 @@
     <div><span>Total</span><strong data-http-phase-value="total">{% if http_timing %}{{ http_timing.total }}{% else %}—{% endif %}</strong></div>
   </div>
   {% endif %}
-  {% if response_chart.points %}
-  <div class="response-chart-legend" aria-label="Chart legend">
-    <span><i class="response-chart-legend-mark response"></i>Response</span>
-    {% if is_http_monitor %}
-    <span><i class="response-chart-legend-mark phase dns"></i>DNS</span>
-    <span><i class="response-chart-legend-mark phase tcp"></i>TCP</span>
-    <span><i class="response-chart-legend-mark phase tls"></i>TLS</span>
-    <span><i class="response-chart-legend-mark phase http"></i>HTTP</span>
-    {% endif %}
-    <span><i class="response-chart-legend-mark average"></i>Average</span>
-    {% if response_chart.threshold_y %}<span><i class="response-chart-legend-mark threshold"></i>Threshold</span>{% endif %}
+  <div class="response-chart-shell" data-response-chart-shell>
+    <canvas class="response-chart" role="img" aria-label="Response time chart"></canvas>
   </div>
-  <div class="response-chart-shell" data-chart-start-ms="{{ response_chart.start_timestamp_ms }}" data-chart-end-ms="{{ response_chart.end_timestamp_ms }}">
-    <svg class="response-chart-y-axis" viewBox="0 0 72 280" width="72" height="280" aria-hidden="true">
-      {% for tick in response_chart.ticks %}
-      <text class="response-chart-tick" x="60" y="{{ tick.label_y }}" text-anchor="end">{{ tick.value }}</text>
-      <line class="response-chart-axis-tick" x1="64" y1="{{ tick.y }}" x2="72" y2="{{ tick.y }}"></line>
-      {% endfor %}
-      <line class="response-chart-axis" x1="71.5" y1="18" x2="71.5" y2="224"></line>
-    </svg>
-    <div class="response-chart-scroll" data-scroll-latest tabindex="0" role="region" aria-label="{{ response_chart.aria_label }} Scroll horizontally to inspect each point.">
-      <svg class="response-chart" viewBox="0 0 {{ response_chart.plot_width }} 280" width="{{ response_chart.plot_width }}" height="280" role="img" aria-label="{{ response_chart.aria_label }}">
-      {% for tick in response_chart.ticks %}
-      <line class="response-chart-grid" x1="0" y1="{{ tick.y }}" x2="{{ response_chart.plot_width }}" y2="{{ tick.y }}"></line>
-      {% endfor %}
-      {% if is_http_monitor %}
-      {% for point in response_chart.points %}
-      {% for segment in point.phase_segments %}
-      <rect class="response-chart-phase-segment {{ segment.phase }}" x="{{ segment.x }}" y="{{ segment.y }}" width="{{ segment.width }}" height="{{ segment.height }}"></rect>
-      {% endfor %}
-      {% endfor %}
-      {% endif %}
-      {% if response_chart.average_y %}
-      <line class="response-chart-average" x1="0" y1="{{ response_chart.average_y }}" x2="{{ response_chart.plot_width }}" y2="{{ response_chart.average_y }}"></line>
-      {% endif %}
-      {% if response_chart.threshold_y %}
-      <line class="response-chart-threshold" x1="0" y1="{{ response_chart.threshold_y }}" x2="{{ response_chart.plot_width }}" y2="{{ response_chart.threshold_y }}"></line>
-      {% endif %}
-      {% for line in response_chart.line_paths %}
-      <path class="response-chart-path" d="{{ line.path_data }}"></path>
-      {% endfor %}
-      {% if is_http_monitor %}
-      <line class="response-chart-hover-line" data-chart-hover-line x1="0" y1="18" x2="0" y2="224" aria-hidden="true"></line>
-      {% endif %}
-      {% for point in response_chart.points %}
-      {% if is_http_monitor %}
-      <circle class="response-chart-point-hit" data-http-timing-point data-chart-x="{{ point.x }}" cx="{{ point.x }}" cy="{{ point.y }}" r="9" data-checked-at="{{ point.checked_at }}" data-dns="{% if point.http_timing %}{{ point.http_timing.dns }}{% else %}—{% endif %}" data-tcp-connect="{% if point.http_timing %}{{ point.http_timing.tcp_connect }}{% else %}—{% endif %}" data-tls-handshake="{% if point.http_timing %}{{ point.http_timing.tls_handshake }}{% else %}—{% endif %}" data-request-to-headers="{% if point.http_timing %}{{ point.http_timing.request_to_headers }}{% else %}—{% endif %}" data-total="{% if point.http_timing %}{{ point.http_timing.total }}{% else %}—{% endif %}" tabindex="0" role="button" aria-pressed="false" aria-label="{{ point.aria_label }}"></circle>
-      {% else %}
-      <circle class="response-chart-point-hit" cx="{{ point.x }}" cy="{{ point.y }}" r="9" tabindex="0" role="img" aria-label="{{ point.aria_label }}"></circle>
-      {% endif %}
-      <circle class="response-chart-point {{ point.status_class }}" cx="{{ point.x }}" cy="{{ point.y }}" r="3.5" aria-hidden="true"></circle>
-      {% endfor %}
-      </svg>
-    </div>
-    <div class="response-chart-x-axis-labels" aria-hidden="true">
-      <span data-chart-visible-start>{{ response_chart.start_label }}</span>
-      <span data-chart-visible-end>{{ response_chart.end_label }}</span>
-    </div>
-  </div>
-  {% else %}
-  <div class="response-chart-empty">No data yet.</div>
-  {% endif %}
 </section>
 
-{% if metric_groups %}
-<section class="detail-panel metric-panel">
+<section class="detail-panel metric-panel" data-metric-panel hidden>
   <h2>Metrics</h2>
-  {% for group in metric_groups %}
-  <div class="metric-group">
-    <h3><span class="metric-group-name">{{ group.name }}</span>{% if group.unit %}<span class="metric-group-unit">{{ group.unit }}</span>{% endif %}</h3>
-    {% for chart in group.charts %}
-    <article class="metric-chart-card">
-      <div class="metric-chart-legend" role="list" aria-label="Metrics in {{ group.name }}">
-        {% for series in chart.series %}
-        <span class="metric-chart-legend-item" role="listitem"><i class="metric-chart-legend-mark metric-series-{{ series.color_index }}" aria-hidden="true"></i>{{ series.label }}</span>
-        {% endfor %}
-      </div>
-      <div class="metric-chart-shell" data-metric-start-ms="{{ chart.start_timestamp_ms }}" data-metric-end-ms="{{ chart.end_timestamp_ms }}">
-        <svg class="metric-chart-y-axis" viewBox="0 0 72 176" width="72" height="176" aria-hidden="true">
-          {% for tick in chart.ticks %}
-          <text class="response-chart-tick" x="60" y="{{ tick.label_y }}" text-anchor="end">{{ tick.value }}</text>
-          <line class="response-chart-axis-tick" x1="64" y1="{{ tick.y }}" x2="72" y2="{{ tick.y }}"></line>
-          {% endfor %}
-          <line class="response-chart-axis" x1="71.5" y1="12" x2="71.5" y2="132"></line>
-        </svg>
-        <div class="metric-chart-scroll" tabindex="0" role="region" aria-label="{{ chart.aria_label }} Scroll horizontally to inspect values.">
-          <svg class="metric-chart" viewBox="0 0 {{ chart.plot_width }} 176" width="{{ chart.plot_width }}" height="176" role="img" aria-label="{{ chart.aria_label }}">
-            {% for tick in chart.ticks %}<line class="response-chart-grid" x1="0" y1="{{ tick.y }}" x2="{{ chart.plot_width }}" y2="{{ tick.y }}"></line>{% endfor %}
-            {% for series in chart.series %}
-            {% for line in series.line_paths %}<path class="metric-chart-path metric-series-{{ series.color_index }}" d="{{ line.path_data }}"></path>{% endfor %}
-            {% endfor %}
-            <line class="metric-chart-hover-line" data-metric-hover-line x1="0" y1="12" x2="0" y2="132" aria-hidden="true"></line>
-            {% for series in chart.series %}
-            {% for point in series.points %}<circle class="metric-chart-point-hit" cx="{{ point.x }}" cy="{{ point.y }}" r="9" data-timestamp-ms="{{ point.timestamp_ms }}" data-checked-at="{{ point.checked_at }}" data-key="{{ series.label }}" data-value="{{ point.value }}" data-color-index="{{ point.color_index }}" tabindex="0" role="img" aria-label="{{ point.aria_label }}"></circle><circle class="metric-chart-point metric-series-{{ point.color_index }}" cx="{{ point.x }}" cy="{{ point.y }}" r="3.5" aria-hidden="true"></circle>{% endfor %}
-            {% endfor %}
-          </svg>
-        </div>
-        <div class="metric-chart-x-axis" aria-hidden="true">
-          <span data-metric-visible-start>{{ chart.start_label }}</span>
-          <span data-metric-visible-end>{{ chart.end_label }}</span>
-        </div>
-      </div>
-    </article>
-    {% endfor %}
-  </div>
-  {% endfor %}
+  <div data-metric-chart-groups></div>
 </section>
-{% endif %}
 
-{% if monitor.message %}
-<section class="detail-panel">
+<section class="detail-panel" data-current-message {% if not monitor.message %}hidden{% endif %}>
   <h2>Message</h2>
-  <p class="check-message">{{ monitor.message }}</p>
+  <p class="check-message" data-current-message-text>{{ monitor.message }}</p>
 </section>
-{% endif %}
 
 {% if tcp_exchange_enabled %}
-{% if latest_tcp_response or has_tcp_check %}
-<section class="detail-panel">
+<section class="detail-panel" data-tcp-response-panel {% if not latest_tcp_response and not has_tcp_check %}hidden{% endif %}>
   <h2>TCP Response</h2>
-  {% if latest_tcp_response %}
-  <pre>{{ latest_tcp_response }}</pre>
-  {% if latest_tcp_response_truncated %}<p class="subtext">Truncated.</p>{% endif %}
-  {% elif has_tcp_check %}
-  <p class="subtext">No response.</p>
-  {% endif %}
+  <pre data-tcp-response-text {% if not latest_tcp_response %}hidden{% endif %}>{% if latest_tcp_response %}{{ latest_tcp_response }}{% endif %}</pre>
+  <p class="subtext" data-tcp-response-empty {% if latest_tcp_response or not has_tcp_check %}hidden{% endif %}>No response.</p>
+  <p class="subtext" data-tcp-response-truncated {% if not latest_tcp_response_truncated %}hidden{% endif %}>Truncated.</p>
 </section>
-{% endif %}
 {% endif %}
 
 <section class="section-heading history-heading">
@@ -185,8 +96,7 @@
     <h2>History</h2>
   </div>
 </section>
-{% if history %}
-<div class="table-frame">
+<div class="table-frame" data-history-table data-history-http="{% if is_http_monitor %}true{% else %}false{% endif %}" data-history-tcp="{% if is_tcp_monitor %}true{% else %}false{% endif %}" {% if not history %}hidden{% endif %}>
   <table>
     <thead>
       <tr>
@@ -198,9 +108,9 @@
         {% if is_tcp_monitor %}<th scope="col">TCP Response</th>{% endif %}
       </tr>
     </thead>
-    <tbody>
+    <tbody data-history-body>
       {% for row in history %}
-      <tr>
+      <tr data-checked-at-ms="{{ row.checked_at_ms }}">
         <td data-label="Time">{{ row.checked_at }}</td>
         <td data-label="Status"><span class="status {{ row.status_class }}">{{ row.status_label }}</span></td>
         <td data-label="Response">{{ row.response_time }}</td>
@@ -219,7 +129,11 @@
     </tbody>
   </table>
 </div>
-{% else %}
-<section class="empty-state"><p>No checks yet.</p></section>
-{% endif %}
+<section class="empty-state" data-history-empty {% if history %}hidden{% endif %}><p>No checks yet.</p></section>
+{% endblock %}
+{% block page_scripts %}
+<script src="/assets/chart.umd.min.js"></script>
+<script src="/assets/hammer.min.js"></script>
+<script src="/assets/chartjs-plugin-zoom.min.js"></script>
+<script src="/assets/status-charts.js"></script>
 {% endblock %}

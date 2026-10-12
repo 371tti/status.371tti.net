@@ -9,18 +9,17 @@ use std::{
     time::Instant,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use kurosabi::{http::HttpMethod, server::tokio::KurosabiTokioServerBuilder};
 use minijinja::{Environment, value::Serde};
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 mod charts;
-use self::charts::{
-    HttpTimingView, MetricGroupView, ResponseTimeChart, ResponseTimeStats, format_chart_timestamp,
-    format_http_timing_summary, format_milliseconds, format_timing, http_timing_view,
-    metric_graphs, response_time_chart, response_time_stats,
-};
+mod dashboard;
+mod detail;
+use self::charts::format_milliseconds;
+use self::dashboard::GroupMonitorData;
 
 use crate::{
     config::{AppConfig, MonitorConfig, MonitorTarget, StatusMessages},
@@ -28,7 +27,7 @@ use crate::{
 };
 
 const MAX_HISTORY: usize = 100;
-const UPTIME_BAR_CHECKS: usize = 100;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const NOT_FOUND_REDIRECT: &str = "https://dev.371tti.net/";
 const MONITORING_UNAVAILABLE_MESSAGE: &str =
     "Monitoring system was unavailable; this interval was not measured.";
@@ -46,6 +45,90 @@ struct RequestCounters {
     total: AtomicU64,
     ping: AtomicU64,
     healthz: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum Route<'a> {
+    Dashboard,
+    Ping,
+    Healthz,
+    Font(&'a str),
+    Asset(&'a str),
+    DashboardStatus,
+    MonitorStatus(&'a str),
+    MonitorCharts {
+        id: &'a str,
+        window_end: &'a str,
+        start: &'a str,
+        end: &'a str,
+    },
+    MonitorDetail(&'a str),
+    NotFound,
+}
+
+impl Route<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Ping => "ping",
+            Self::Healthz => "healthz",
+            Self::Font(_) => "font",
+            Self::Asset(_) => "asset",
+            Self::DashboardStatus => "dashboard_status",
+            Self::MonitorStatus(_) => "monitor_status",
+            Self::MonitorCharts { .. } => "monitor_chart_data",
+            Self::MonitorDetail(_) => "monitor_detail",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+fn route_for_path(path: &[String]) -> Route<'_> {
+    match path {
+        [root] if root.is_empty() => Route::Dashboard,
+        [ping] if ping == "ping" => Route::Ping,
+        [healthz] if healthz == "healthz" => Route::Healthz,
+        [fonts, font]
+            if fonts == "fonts"
+                && matches!(
+                    font.as_str(),
+                    "UDEVGothicHSLG-Regular.woff2" | "UDEVGothicHSLG-Bold.woff2"
+                ) =>
+        {
+            Route::Font(font)
+        }
+        [assets, asset]
+            if assets == "assets"
+                && matches!(
+                    asset.as_str(),
+                    "chart.umd.min.js"
+                        | "hammer.min.js"
+                        | "chartjs-plugin-zoom.min.js"
+                        | "status-charts.js"
+                        | "status-updates.js"
+                ) =>
+        {
+            Route::Asset(asset)
+        }
+        [api, status] if api == "api" && status == "status" => Route::DashboardStatus,
+        [api, monitors, id, status]
+            if api == "api" && monitors == "monitors" && status == "status" =>
+        {
+            Route::MonitorStatus(id)
+        }
+        [api, monitors, id, charts, window_end, start, end]
+            if api == "api" && monitors == "monitors" && charts == "charts" =>
+        {
+            Route::MonitorCharts {
+                id,
+                window_end,
+                start,
+                end,
+            }
+        }
+        [monitors, id] if monitors == "monitors" => Route::MonitorDetail(id),
+        _ => Route::NotFound,
+    }
 }
 
 pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
@@ -73,30 +156,12 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                     .iter()
                     .map(|segment| segment.to_string())
                     .collect();
-                let route = match path.as_slice() {
-                    [root] if root.is_empty() => "dashboard",
-                    [ping] if ping == "ping" => "ping",
-                    [healthz] if healthz == "healthz" => "healthz",
-                    [fonts, font]
-                        if fonts == "fonts"
-                            && (font == "UDEVGothicHSLG-Regular.woff2"
-                                || font == "UDEVGothicHSLG-Bold.woff2") =>
-                    {
-                        "font"
-                    }
-                    [monitors, _] if monitors == "monitors" => "monitor_detail",
-                    _ => "not_found",
-                };
-                info!(
-                    method = ?conn.req.method(),
-                    route,
-                    request_count = total_count,
-                    "HTTP request received"
-                );
+                let route = route_for_path(&path);
+                let route_name = route.name();
                 if conn.req.method() != &HttpMethod::GET {
                     warn!(
                         method = ?conn.req.method(),
-                        route,
+                        route = route_name,
                         "HTTP method not allowed"
                     );
                     return conn.set_status_code(405u16).html_body(error_page(
@@ -106,8 +171,8 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                 }
 
                 // Expose only application routes; workspace and configuration files are never served.
-                match path.as_slice() {
-                    [root] if root.is_empty() => match dashboard(&state).await {
+                match route {
+                    Route::Dashboard => match dashboard::dashboard(&state).await {
                         Ok(html) => conn.html_body(html),
                         Err(error) => {
                             error!(error = %error, "failed to render dashboard");
@@ -117,7 +182,7 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                             ))
                         }
                     },
-                    [ping] if ping == "ping" => {
+                    Route::Ping => {
                         let ping_count = state.counters.ping.fetch_add(1, Ordering::Relaxed) + 1;
                         conn.text_body(format!(
                             "status.code 0\nserver.requests.unit requests\nserver.requests.total {total_count}\nserver.requests.ping {ping_count}\nserver.requests.healthz {}\nprocess.unit s\nprocess.uptime_seconds {:.1}\n",
@@ -125,7 +190,7 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                             state.started_at.elapsed().as_secs_f64(),
                         ))
                     }
-                    [healthz] if healthz == "healthz" => {
+                    Route::Healthz => {
                         let healthz_count = state.counters.healthz.fetch_add(1, Ordering::Relaxed) + 1;
                         conn.text_body(format!(
                             "status.code 0\nserver.requests.unit requests\nserver.requests.total {total_count}\nserver.requests.ping {}\nserver.requests.healthz {healthz_count}\nprocess.unit s\nprocess.uptime_seconds {:.1}\n",
@@ -133,16 +198,160 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                             state.started_at.elapsed().as_secs_f64(),
                         ))
                     }
-                    [fonts, font] if fonts == "fonts" && font == "UDEVGothicHSLG-Regular.woff2" => conn
+                    Route::Font("UDEVGothicHSLG-Regular.woff2") => conn
                         .add_header("Content-Type", "font/woff2")
                         .add_header("Cache-Control", "public, max-age=86400")
                         .binary_body(include_bytes!("../fonts/UDEVGothicHSLG-Regular.woff2")),
-                    [fonts, font] if fonts == "fonts" && font == "UDEVGothicHSLG-Bold.woff2" => conn
+                    Route::Font("UDEVGothicHSLG-Bold.woff2") => conn
                         .add_header("Content-Type", "font/woff2")
                         .add_header("Cache-Control", "public, max-age=86400")
                         .binary_body(include_bytes!("../fonts/UDEVGothicHSLG-Bold.woff2")),
-                    [monitors, id] if monitors == "monitors" => {
-                        match monitor_detail(&state, id).await {
+                    Route::Asset("chart.umd.min.js") => conn
+                        .add_header("Content-Type", "text/javascript; charset=utf-8")
+                        .add_header("Cache-Control", "public, max-age=86400")
+                        .binary_body(include_bytes!("../assets/chart.umd.min.js")),
+                    Route::Asset("hammer.min.js") => conn
+                        .add_header("Content-Type", "text/javascript; charset=utf-8")
+                        .add_header("Cache-Control", "public, max-age=86400")
+                        .binary_body(include_bytes!("../assets/hammer.min.js")),
+                    Route::Asset("chartjs-plugin-zoom.min.js") => {
+                        conn.add_header("Content-Type", "text/javascript; charset=utf-8")
+                            .add_header("Cache-Control", "public, max-age=86400")
+                            .binary_body(include_bytes!("../assets/chartjs-plugin-zoom.min.js"))
+                    }
+                    Route::Asset("status-charts.js") => conn
+                        .add_header("Content-Type", "text/javascript; charset=utf-8")
+                        .add_header("Cache-Control", "public, max-age=86400")
+                        .binary_body(include_bytes!("../assets/status-charts.js")),
+                    Route::Asset("status-updates.js") => conn
+                        .add_header("Content-Type", "text/javascript; charset=utf-8")
+                        .add_header("Cache-Control", "public, max-age=86400")
+                        .binary_body(include_bytes!("../assets/status-updates.js")),
+                    Route::DashboardStatus => {
+                        match dashboard::dashboard_data(&state).await {
+                            Ok(data) => match serde_json::to_string(&data) {
+                                Ok(body) => conn
+                                    .add_header("Content-Type", "application/json; charset=utf-8")
+                                    .add_header("Cache-Control", "no-store")
+                                    .binary_body(body.as_bytes()),
+                                Err(error) => {
+                                    error!(error = %error, "failed to encode dashboard status");
+                                    conn.set_status_code(500u16)
+                                        .add_header("Content-Type", "application/json; charset=utf-8")
+                                        .binary_body(b"{\"error\":\"Status data is unavailable.\"}")
+                                }
+                            },
+                            Err(error) => {
+                                error!(error = %error, "failed to load dashboard status");
+                                conn.set_status_code(500u16)
+                                    .add_header("Content-Type", "application/json; charset=utf-8")
+                                    .binary_body(b"{\"error\":\"Status data is unavailable.\"}")
+                            }
+                        }
+                    }
+                    Route::MonitorStatus(id) => {
+                        match detail::monitor_detail_data(&state, id).await {
+                            Ok(Some(data)) => match serde_json::to_string(&data) {
+                                Ok(body) => conn
+                                    .add_header("Content-Type", "application/json; charset=utf-8")
+                                    .add_header("Cache-Control", "no-store")
+                                    .binary_body(body.as_bytes()),
+                                Err(error) => {
+                                    error!(monitor_id = %id, error = %error, "failed to encode monitor status");
+                                    conn.set_status_code(500u16)
+                                        .add_header("Content-Type", "application/json; charset=utf-8")
+                                        .binary_body(b"{\"error\":\"Status data is unavailable.\"}")
+                                }
+                            },
+                            Ok(None) => conn
+                                .set_status_code(404u16)
+                                .add_header("Content-Type", "application/json; charset=utf-8")
+                                .binary_body(b"{\"error\":\"Monitor not found.\"}"),
+                            Err(error) => {
+                                error!(monitor_id = %id, error = %error, "failed to load monitor status");
+                                conn.set_status_code(500u16)
+                                    .add_header("Content-Type", "application/json; charset=utf-8")
+                                    .binary_body(b"{\"error\":\"Status data is unavailable.\"}")
+                            }
+                        }
+                    }
+                    Route::MonitorCharts {
+                        id,
+                        window_end,
+                        start,
+                        end,
+                    } => {
+                        let parsed_range = window_end
+                            .parse::<i64>()
+                            .ok()
+                            .zip(start.parse::<i64>().ok())
+                            .zip(end.parse::<i64>().ok())
+                            .map(|((window_end, start), end)| (window_end, start, end));
+                        match parsed_range {
+                            Some((window_end, start, end)) if start < end => {
+                                match detail::monitor_chart_data(
+                                    &state,
+                                    id,
+                                    window_end,
+                                    start,
+                                    end,
+                                )
+                                .await
+                                {
+                                    Ok(Some(data)) => match serde_json::to_string(&data) {
+                                        Ok(body) => conn
+                                            .add_header(
+                                                "Content-Type",
+                                                "application/json; charset=utf-8",
+                                            )
+                                            .add_header("Cache-Control", "no-store")
+                                            .binary_body(body.as_bytes()),
+                                        Err(error) => {
+                                            error!(monitor_id = %id, error = %error, "failed to encode monitor chart data");
+                                            conn.set_status_code(500u16)
+                                                .add_header(
+                                                    "Content-Type",
+                                                    "application/json; charset=utf-8",
+                                                )
+                                                .binary_body(b"{\"error\":\"Chart data is unavailable.\"}")
+                                        }
+                                    },
+                                    Ok(None) => conn
+                                        .set_status_code(404u16)
+                                        .add_header(
+                                            "Content-Type",
+                                            "application/json; charset=utf-8",
+                                        )
+                                        .binary_body(b"{\"error\":\"Monitor not found.\"}"),
+                                    Err(error) if error.kind() == io::ErrorKind::InvalidInput => conn
+                                        .set_status_code(400u16)
+                                        .add_header(
+                                            "Content-Type",
+                                            "application/json; charset=utf-8",
+                                        )
+                                        .binary_body(b"{\"error\":\"Invalid chart range.\"}"),
+                                    Err(error) => {
+                                        error!(monitor_id = %id, error = %error, "failed to load monitor chart data");
+                                        conn.set_status_code(500u16)
+                                            .add_header(
+                                                "Content-Type",
+                                                "application/json; charset=utf-8",
+                                            )
+                                            .binary_body(b"{\"error\":\"Chart data is unavailable.\"}")
+                                    }
+                                }
+                            }
+                            _ => conn
+                                .set_status_code(400u16)
+                                .add_header(
+                                    "Content-Type",
+                                    "application/json; charset=utf-8",
+                                )
+                                .binary_body(b"{\"error\":\"Invalid chart range.\"}"),
+                        }
+                    }
+                    Route::MonitorDetail(id) => {
+                        match detail::monitor_detail(&state, id).await {
                             Ok(Some(html)) => conn.html_body(html),
                             Ok(None) => conn.redirect(NOT_FOUND_REDIRECT),
                             Err(error) => {
@@ -154,129 +363,14 @@ pub async fn serve(config: AppConfig, store: Store) -> std::io::Result<()> {
                             }
                         }
                     }
-                    _ => conn.redirect(NOT_FOUND_REDIRECT),
+                    Route::NotFound | Route::Font(_) | Route::Asset(_) => {
+                        conn.redirect(NOT_FOUND_REDIRECT)
+                    }
                 }
             }
         });
 
-    info!(bind = %bind, port, "HTTP server listening");
     server.run().await
-}
-
-async fn dashboard(state: &WebState) -> io::Result<String> {
-    let mut grouped_monitors = BTreeMap::<(String, bool), Vec<GroupMonitorData>>::new();
-    let mut normal_count = 0usize;
-    let mut down_count = 0usize;
-    let mut slow_count = 0usize;
-    let mut pending_count = 0usize;
-    let mut status_total_count = 0usize;
-    let now_ms = Utc::now().timestamp_millis();
-
-    for (config_index, monitor) in state.config.monitors.iter().enumerate() {
-        let records = state.store.history(&monitor.id, UPTIME_BAR_CHECKS).await?;
-        let bar_history = scheduled_check_history(
-            &records,
-            monitor.interval_seconds,
-            now_ms,
-            UPTIME_BAR_CHECKS,
-        );
-        let latest = bar_history.first();
-        let retention_days = state.config.storage.retention_days;
-        let normal_percent = state
-            .store
-            .normal_percent(
-                &monitor.id,
-                retention_days,
-                monitor.slow_response_threshold_ms,
-            )
-            .await?;
-        let view = monitor_view(
-            monitor,
-            latest,
-            normal_percent,
-            retention_days,
-            &bar_history,
-        );
-        if !monitor.exclude_from_aggregate_status {
-            status_total_count += 1;
-            match view.status_class.as_str() {
-                "up" => normal_count += 1,
-                "down" => down_count += 1,
-                "slow" => slow_count += 1,
-                _ => pending_count += 1,
-            }
-        }
-        grouped_monitors
-            .entry(monitor_group_key(&monitor.id))
-            .or_default()
-            .push(GroupMonitorData {
-                view,
-                history: bar_history,
-                interval_seconds: monitor.interval_seconds,
-                slow_response_threshold_ms: monitor.slow_response_threshold_ms,
-                exclude_from_aggregate_status: monitor.exclude_from_aggregate_status,
-                order: monitor.order,
-                config_index,
-            });
-    }
-
-    let mut groups = grouped_monitors
-        .into_iter()
-        .map(|((name, is_ungrouped), mut monitors)| {
-            monitors.sort_by_key(|monitor| {
-                (
-                    monitor.order.is_none(),
-                    monitor.order.unwrap_or_default(),
-                    monitor.config_index,
-                )
-            });
-            let group_order = monitors.iter().filter_map(|monitor| monitor.order).min();
-            (
-                (
-                    is_ungrouped,
-                    group_order.is_none(),
-                    group_order.unwrap_or_default(),
-                    name.clone(),
-                ),
-                monitor_group_view(name, is_ungrouped, monitors, &state.config.status_messages),
-            )
-        })
-        .collect::<Vec<_>>();
-    groups.sort_by(|(left_order, _), (right_order, _)| left_order.cmp(right_order));
-    let groups = groups
-        .into_iter()
-        .map(|(_, group)| group)
-        .collect::<Vec<_>>();
-    let (overall_status_class, overall_status_label) = aggregate_status(
-        state.config.monitors.len(),
-        status_total_count,
-        down_count,
-        slow_count,
-        pending_count,
-        &state.config.status_messages,
-    );
-
-    let context = DashboardContext {
-        app_name: state.config.server.name.clone(),
-        page_title: "Status".to_owned(),
-        generated_at: format_timestamp(Utc::now().timestamp_millis()),
-        status_total_count,
-        normal_count,
-        down_count,
-        slow_count,
-        pending_count,
-        overall_status_class: overall_status_class.to_owned(),
-        overall_status_label: overall_status_label.to_owned(),
-        groups,
-    };
-    render("dashboard.html", &context).map_err(io::Error::other)
-}
-
-fn monitor_group_key(monitor_id: &str) -> (String, bool) {
-    monitor_id
-        .rsplit_once('.')
-        .map(|(group, _)| (group.to_owned(), false))
-        .unwrap_or_else(|| ("Other".to_owned(), true))
 }
 
 fn aggregate_status(
@@ -345,10 +439,31 @@ fn compact_status_label(status_class: &str) -> &'static str {
     }
 }
 
-fn is_slow_response(is_up: bool, latency_ms: Option<f64>, threshold_ms: Option<u64>) -> bool {
-    is_up
-        && threshold_ms
-            .is_some_and(|threshold| latency_ms.is_some_and(|latency| latency > threshold as f64))
+fn is_slow_response(record: &CheckRecord, threshold_ms: Option<u64>) -> bool {
+    record.is_up
+        && threshold_ms.is_some_and(|threshold| {
+            record
+                .latency_ms
+                .is_some_and(|latency| latency > threshold as f64)
+                || record.metrics.iter().any(|(key, value)| {
+                    key.starts_with("response.")
+                        && key != "response.ms"
+                        && *value > threshold as f64
+                })
+        })
+}
+
+fn normal_percent_for_history(history: &[CheckRecord], threshold_ms: Option<u64>) -> Option<f64> {
+    if history.is_empty() {
+        return None;
+    }
+    let normal_count = history
+        .iter()
+        .filter(|record| {
+            record.is_up && !record.is_degraded && !is_slow_response(record, threshold_ms)
+        })
+        .count();
+    Some(normal_count as f64 * 100.0 / history.len() as f64)
 }
 
 fn record_status(record: &CheckRecord, threshold_ms: Option<u64>) -> (&'static str, &'static str) {
@@ -356,298 +471,257 @@ fn record_status(record: &CheckRecord, threshold_ms: Option<u64>) -> (&'static s
         ("pending", "Pending")
     } else if !record.is_up {
         ("down", "Down")
-    } else if record.is_degraded || is_slow_response(record.is_up, record.latency_ms, threshold_ms)
-    {
+    } else if record.is_degraded || is_slow_response(record, threshold_ms) {
         ("slow", "Degraded")
     } else {
         ("up", "Operational")
     }
 }
 
-fn monitor_group_view(
-    name: String,
-    is_ungrouped: bool,
-    monitors: Vec<GroupMonitorData>,
-    status_messages: &StatusMessages,
-) -> MonitorGroupView {
-    let (
-        uptime_bar,
-        uptime_bar_label,
-        uptime_bar_caption,
-        uptime_bar_start_label,
-        uptime_bar_end_label,
-    ) = group_uptime_bar(&monitors, status_messages);
-    let total_count = monitors.len();
-    let included_monitors: Vec<_> = monitors
-        .iter()
-        .filter(|monitor| !monitor.exclude_from_aggregate_status)
-        .collect();
-    let status_total_count = included_monitors.len();
-    let normal_count = included_monitors
-        .iter()
-        .filter(|monitor| monitor.view.status_class == "up")
-        .count();
-    let down_count = included_monitors
-        .iter()
-        .filter(|monitor| monitor.view.status_class == "down")
-        .count();
-    let slow_count = included_monitors
-        .iter()
-        .filter(|monitor| monitor.view.status_class == "slow")
-        .count();
-    let pending_count = status_total_count - normal_count - down_count - slow_count;
-    let (status_class, status_label) = aggregate_status(
-        total_count,
-        status_total_count,
-        down_count,
-        slow_count,
-        pending_count,
-        status_messages,
-    );
-    let monitors = monitors.into_iter().map(|monitor| monitor.view).collect();
+#[derive(Default)]
+struct PeriodCounts {
+    operational: usize,
+    degraded: usize,
+    down: usize,
+    pending: usize,
+}
 
-    MonitorGroupView {
-        name,
-        show_group_status: !is_ungrouped,
-        total_count,
-        status_total_count,
-        normal_count,
-        down_count,
-        slow_count,
-        pending_count,
-        status_class: status_class.to_owned(),
-        status_label: status_label.to_owned(),
-        uptime_bar,
-        uptime_bar_label,
-        uptime_bar_caption,
-        uptime_bar_start_label,
-        uptime_bar_end_label,
-        monitors,
+impl PeriodCounts {
+    fn status_class(&self) -> &'static str {
+        if self.down > 0 {
+            "down"
+        } else if self.degraded > 0 {
+            "slow"
+        } else if self.pending > 0 || self.operational == 0 {
+            "pending"
+        } else {
+            "up"
+        }
     }
 }
 
-fn group_uptime_bar(
-    monitors: &[GroupMonitorData],
-    status_messages: &StatusMessages,
-) -> (Vec<UptimeSegment>, String, String, String, String) {
-    let included_monitors: Vec<_> = monitors
-        .iter()
-        .filter(|monitor| !monitor.exclude_from_aggregate_status)
-        .collect();
-    let included_count = included_monitors.len();
-    if included_count == 0 {
-        return (
-            Vec::new(),
-            "No included services to summarize.".to_owned(),
-            "No included services.".to_owned(),
-            String::new(),
-            String::new(),
-        );
-    }
-
-    let empty_caption = "No checks yet.".to_owned();
-    if included_monitors
-        .iter()
-        .any(|monitor| monitor.history.is_empty())
-    {
-        return (
-            Vec::new(),
-            "No checks yet.".to_owned(),
-            empty_caption,
-            String::new(),
-            String::new(),
-        );
-    }
-
-    let common_start_ms = included_monitors
-        .iter()
-        .filter_map(|monitor| monitor.history.last().map(|record| record.checked_at_ms))
-        .max()
-        .unwrap_or_else(|| Utc::now().timestamp_millis());
-    let interval_seconds = included_monitors
-        .iter()
-        .map(|monitor| monitor.interval_seconds)
-        .min()
-        .unwrap_or(60);
-    let interval_ms = interval_millis(interval_seconds);
-    let now_ms = Utc::now().timestamp_millis();
-    let latest_sample_slot = schedule_slot(now_ms, interval_ms);
-    let mut first_available_slot = schedule_slot(common_start_ms, interval_ms);
-    if common_start_ms.rem_euclid(interval_ms) != 0 {
-        first_available_slot = first_available_slot.saturating_add(1);
-    }
-    let available_count = latest_sample_slot
-        .saturating_sub(first_available_slot)
-        .saturating_add(1)
-        .max(0) as usize;
-    if available_count == 0 {
-        return (
-            Vec::new(),
-            "No checks yet.".to_owned(),
-            empty_caption,
-            String::new(),
-            String::new(),
-        );
-    }
-    let segment_count = available_count.min(UPTIME_BAR_CHECKS);
-    let first_sample_slot = latest_sample_slot.saturating_sub(segment_count as i64 - 1);
-    let first_sample_ms = first_sample_slot.saturating_mul(interval_ms);
-    let mut normal_samples = 0usize;
-    let mut down_samples = 0usize;
-    let mut slow_samples = 0usize;
-    let mut pending_samples = 0usize;
-    let mut uptime_bar = Vec::with_capacity(segment_count);
-
-    for sample_index in 0..segment_count {
-        let sample_ms = first_sample_ms + sample_index as i64 * interval_ms;
-        let mut normal_count = 0usize;
-        let mut down_count = 0usize;
-        let mut slow_count = 0usize;
-        let mut pending_count = 0usize;
-
-        for monitor in &included_monitors {
-            let monitor_interval_ms = interval_millis(monitor.interval_seconds);
-            let expected_slot = schedule_slot(sample_ms, monitor_interval_ms);
-            let latest = monitor
-                .history
-                .iter()
-                .filter(|record| {
-                    schedule_slot(record.checked_at_ms, monitor_interval_ms) == expected_slot
-                })
-                .max_by_key(|record| record.checked_at_ms);
-            match latest {
-                None => pending_count += 1,
-                Some(record) if record.is_pending => pending_count += 1,
-                Some(record) if !record.is_up => down_count += 1,
-                Some(record)
-                    if is_slow_response(
-                        record.is_up,
-                        record.latency_ms,
-                        monitor.slow_response_threshold_ms,
-                    ) || record.is_degraded =>
-                {
-                    slow_count += 1;
-                }
-                Some(_) => normal_count += 1,
-            }
-        }
-
-        let (status_class, _) = aggregate_status(
-            monitors.len(),
-            included_count,
-            down_count,
-            slow_count,
-            pending_count,
-            status_messages,
-        );
-        let status_label = compact_status_label(status_class);
-        match status_class {
-            "up" => normal_samples += 1,
-            "down" => down_samples += 1,
-            "slow" => slow_samples += 1,
-            _ => pending_samples += 1,
-        }
-        uptime_bar.push(UptimeSegment {
-            status_class: status_class.to_owned(),
-            title: format!(
-                "{} · {} · Operational: {}/{} · Degraded: {} · Down: {} · Pending: {}",
-                format_timestamp(sample_ms),
-                status_label,
-                normal_count,
-                included_count,
-                slow_count,
-                down_count,
-                pending_count
-            ),
-        });
-    }
-
-    let count = uptime_bar.len();
-    let uptime_bar_label = format!(
-        "Last {} intervals: {} operational, {} degraded, {} down, {} pending",
-        count, normal_samples, slow_samples, down_samples, pending_samples
-    );
-    let uptime_bar_caption = format!(
-        "Last {} intervals · {} seconds each",
-        count, interval_seconds
-    );
-    let uptime_bar_start_label = format_chart_timestamp(first_sample_ms);
-    let last_sample_ms = first_sample_ms + (segment_count.saturating_sub(1) as i64) * interval_ms;
-    let uptime_bar_end_label = format_chart_timestamp(last_sample_ms);
+fn status_bar_period(retention_start_ms: i64, index: usize, samples_per_day: u32) -> (i64, i64) {
+    let per_day = samples_per_day as usize;
+    let day_index = (index / per_day) as i64;
+    let sample_index = (index % per_day) as i64;
+    let day_start = retention_start_ms.saturating_add(day_index.saturating_mul(MILLIS_PER_DAY));
+    let samples = i64::from(samples_per_day);
     (
-        uptime_bar,
-        uptime_bar_label,
-        uptime_bar_caption,
-        uptime_bar_start_label,
-        uptime_bar_end_label,
+        day_start.saturating_add(sample_index.saturating_mul(MILLIS_PER_DAY) / samples),
+        day_start.saturating_add((sample_index + 1).saturating_mul(MILLIS_PER_DAY) / samples),
     )
 }
 
-async fn monitor_detail(state: &WebState, id: &str) -> io::Result<Option<String>> {
-    let Some(monitor) = state
-        .config
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == id)
-    else {
-        return Ok(None);
-    };
-    let records = state.store.history(&monitor.id, MAX_HISTORY).await?;
-    let history = scheduled_check_history(
-        &records,
-        monitor.interval_seconds,
-        Utc::now().timestamp_millis(),
-        MAX_HISTORY,
-    );
-    let latest = history.first();
-    let retention_days = state.config.storage.retention_days;
-    let normal_percent = state
-        .store
-        .normal_percent(
-            &monitor.id,
-            retention_days,
-            monitor.slow_response_threshold_ms,
-        )
-        .await?;
-    let (response_time_stats, average_latency_ms) = response_time_stats(&history);
-    let context = DetailContext {
-        app_name: state.config.server.name.clone(),
-        page_title: monitor.name.clone(),
-        monitor: monitor_view(monitor, latest, normal_percent, retention_days, &history),
-        response_chart: response_time_chart(
-            &history,
-            monitor.slow_response_threshold_ms,
-            average_latency_ms,
-        ),
-        metric_groups: metric_graphs(&history),
-        response_time_stats,
-        is_http_monitor: matches!(&monitor.target, MonitorTarget::Http { .. }),
-        http_timing: latest
-            .filter(|record| !record.is_pending)
-            .and_then(|record| record.http_timings.as_ref().map(http_timing_view)),
-        is_tcp_monitor: matches!(&monitor.target, MonitorTarget::Tcp { .. }),
-        tcp_exchange_enabled: matches!(
-            &monitor.target,
-            MonitorTarget::Tcp {
-                send_message: Some(_),
-                ..
+fn monitor_status_buckets(
+    history: &[CheckRecord],
+    interval_seconds: u64,
+    threshold_ms: Option<u64>,
+    retention_start_ms: i64,
+    retention_days: u32,
+    samples_per_day: u32,
+) -> Vec<PeriodCounts> {
+    let total_segments = retention_days as usize * samples_per_day as usize;
+    let mut scheduled_by_segment = (0..total_segments)
+        .map(|_| BTreeMap::<i64, &CheckRecord>::new())
+        .collect::<Vec<_>>();
+    let interval_ms = interval_millis(interval_seconds);
+    let retention_end_ms =
+        retention_start_ms.saturating_add(i64::from(retention_days).saturating_mul(MILLIS_PER_DAY));
+    for record in history.iter().filter(|record| {
+        record.checked_at_ms >= retention_start_ms && record.checked_at_ms < retention_end_ms
+    }) {
+        let elapsed = record.checked_at_ms.saturating_sub(retention_start_ms);
+        let day_index = elapsed / MILLIS_PER_DAY;
+        let within_day = elapsed % MILLIS_PER_DAY;
+        let sample_index = within_day.saturating_mul(i64::from(samples_per_day)) / MILLIS_PER_DAY;
+        let segment_index = (day_index as usize * samples_per_day as usize + sample_index as usize)
+            .min(total_segments.saturating_sub(1));
+        let slot = schedule_slot(record.checked_at_ms, interval_ms);
+        let replace = scheduled_by_segment[segment_index]
+            .get(&slot)
+            .is_none_or(|stored| record.checked_at_ms > stored.checked_at_ms);
+        if replace {
+            scheduled_by_segment[segment_index].insert(slot, record);
+        }
+    }
+
+    let mut previous_status = "pending";
+    scheduled_by_segment
+        .into_iter()
+        .enumerate()
+        .map(|(index, scheduled_records)| {
+            let (start_ms, end_ms) = status_bar_period(retention_start_ms, index, samples_per_day);
+            let first_expected = start_ms.div_euclid(interval_ms)
+                + if start_ms.rem_euclid(interval_ms) != 0 {
+                    1
+                } else {
+                    0
+                };
+            let last_expected = end_ms.saturating_sub(1).div_euclid(interval_ms);
+            let expected = if last_expected >= first_expected {
+                (last_expected - first_expected + 1) as usize
+            } else {
+                0
+            };
+            let mut counts = PeriodCounts::default();
+            for record in scheduled_records.values() {
+                match record_status(record, threshold_ms).0 {
+                    "up" => counts.operational += 1,
+                    "slow" => counts.degraded += 1,
+                    "down" => counts.down += 1,
+                    _ => counts.pending += 1,
+                }
             }
-        ),
-        has_tcp_check: !records.is_empty(),
-        latest_tcp_response: records
-            .first()
-            .and_then(|record| record.tcp_response.as_deref().map(format_tcp_response)),
-        latest_tcp_response_truncated: records
-            .first()
-            .is_some_and(|record| record.tcp_response_truncated),
-        history: history
-            .iter()
-            .map(|record| history_view(monitor, record))
-            .collect(),
+            counts.pending += expected.saturating_sub(scheduled_records.len());
+            if expected == 0 && scheduled_records.is_empty() {
+                match previous_status {
+                    "up" => counts.operational = 1,
+                    "slow" => counts.degraded = 1,
+                    "down" => counts.down = 1,
+                    _ => counts.pending = 1,
+                }
+            }
+            previous_status = counts.status_class();
+            counts
+        })
+        .collect()
+}
+
+fn monitor_period_status(
+    monitor: &GroupMonitorData,
+    retention_start_ms: i64,
+    retention_days: u32,
+    samples_per_day: u32,
+) -> Vec<PeriodCounts> {
+    monitor_status_buckets(
+        &monitor.history,
+        monitor.interval_seconds,
+        monitor.slow_response_threshold_ms,
+        retention_start_ms,
+        retention_days,
+        samples_per_day,
+    )
+}
+
+fn monitor_uptime_bar(
+    history: &[CheckRecord],
+    interval_seconds: u64,
+    threshold_ms: Option<u64>,
+    retention_days: u32,
+    samples_per_day: u32,
+    now_ms: i64,
+) -> (Vec<UptimeSegment>, String, String, String) {
+    let retention_start_ms = now_ms.saturating_sub(i64::from(retention_days) * MILLIS_PER_DAY);
+    let status_buckets = monitor_status_buckets(
+        history,
+        interval_seconds,
+        threshold_ms,
+        retention_start_ms,
+        retention_days,
+        samples_per_day,
+    );
+    let mut totals = PeriodCounts::default();
+    let mut segments = Vec::with_capacity(status_buckets.len());
+    for (index, counts) in status_buckets.into_iter().enumerate() {
+        let (start_ms, end_ms) = status_bar_period(retention_start_ms, index, samples_per_day);
+        let status_class = counts.status_class();
+        match status_class {
+            "up" => totals.operational += 1,
+            "slow" => totals.degraded += 1,
+            "down" => totals.down += 1,
+            _ => totals.pending += 1,
+        }
+        segments.push(UptimeSegment {
+            status_class: status_class.to_owned(),
+            title: format!(
+                "{} – {} · {} · Operational: {} · Degraded: {} · Down: {} · Pending: {}",
+                format_timestamp(start_ms),
+                format_timestamp(end_ms),
+                compact_status_label(status_class),
+                counts.operational,
+                counts.degraded,
+                counts.down,
+                counts.pending
+            ),
+        });
+    }
+    let start_label = segments
+        .first()
+        .map(|_| format_duration_ago(u64::from(retention_days).saturating_mul(86_400)))
+        .unwrap_or_default();
+    let end_label = if segments.is_empty() {
+        String::new()
+    } else {
+        "Now".to_owned()
     };
-    render("detail.html", &context)
-        .map(Some)
-        .map_err(io::Error::other)
+    let label = format!(
+        "Last {retention_days} days: {} samples, {} operational, {} degraded, {} down, {} pending",
+        segments.len(),
+        totals.operational,
+        totals.degraded,
+        totals.down,
+        totals.pending
+    );
+    (segments, label, start_label, end_label)
+}
+
+fn recent_check_uptime_bar(
+    history: &[CheckRecord],
+    interval_seconds: u64,
+    threshold_ms: Option<u64>,
+    segment_count: usize,
+    now_ms: i64,
+) -> (Vec<UptimeSegment>, String, String, String) {
+    if segment_count == 0 {
+        return (Vec::new(), String::new(), String::new(), String::new());
+    }
+
+    let interval_ms = interval_millis(interval_seconds);
+    let last_slot = schedule_slot(now_ms, interval_ms);
+    let slot_count = segment_count.saturating_sub(1).min(i64::MAX as usize) as i64;
+    let first_slot = last_slot.saturating_sub(slot_count);
+    let mut records_by_slot = BTreeMap::<i64, &CheckRecord>::new();
+    for record in history {
+        let slot = schedule_slot(record.checked_at_ms, interval_ms);
+        if slot < first_slot || slot > last_slot {
+            continue;
+        }
+        let replace = records_by_slot
+            .get(&slot)
+            .is_none_or(|stored| record.checked_at_ms > stored.checked_at_ms);
+        if replace {
+            records_by_slot.insert(slot, record);
+        }
+    }
+
+    let mut counts = PeriodCounts::default();
+    let mut segments = Vec::with_capacity(segment_count);
+    for index in 0..segment_count {
+        let slot = first_slot.saturating_add(index.min(i64::MAX as usize) as i64);
+        let expected_at_ms = slot.saturating_mul(interval_ms);
+        let record = records_by_slot.get(&slot).copied();
+        let (status_class, status_label) = record
+            .map(|record| record_status(record, threshold_ms))
+            .unwrap_or(("pending", "Pending"));
+        match status_class {
+            "up" => counts.operational += 1,
+            "slow" => counts.degraded += 1,
+            "down" => counts.down += 1,
+            _ => counts.pending += 1,
+        }
+        segments.push(UptimeSegment {
+            status_class: status_class.to_owned(),
+            title: format!("{} · {status_label}", format_timestamp(expected_at_ms)),
+        });
+    }
+
+    let label = format!(
+        "Last {segment_count} checks: {} operational, {} degraded, {} down, {} pending",
+        counts.operational, counts.degraded, counts.down, counts.pending
+    );
+    let start_label = format_duration_ago((segment_count as u64).saturating_mul(interval_seconds));
+    let end_label = "Now".to_owned();
+    (segments, label, start_label, end_label)
 }
 
 fn monitor_view(
@@ -656,6 +730,8 @@ fn monitor_view(
     normal_percent: Option<f64>,
     normal_days: u32,
     bar_history: &[CheckRecord],
+    samples_per_day: u32,
+    now_ms: i64,
 ) -> MonitorView {
     let (kind, target) = match &monitor.target {
         MonitorTarget::Http { url, method, .. } => {
@@ -710,43 +786,15 @@ fn monitor_view(
             String::new(),
         ),
     };
-    let normal_count = bar_history
-        .iter()
-        .filter(|record| record_status(record, monitor.slow_response_threshold_ms).0 == "up")
-        .count();
-    let slow_count = bar_history
-        .iter()
-        .filter(|record| record_status(record, monitor.slow_response_threshold_ms).0 == "slow")
-        .count();
-    let down_count = bar_history
-        .iter()
-        .filter(|record| record_status(record, monitor.slow_response_threshold_ms).0 == "down")
-        .count();
-    let pending_count = bar_history
-        .iter()
-        .filter(|record| record_status(record, monitor.slow_response_threshold_ms).0 == "pending")
-        .count();
-    let uptime_bar_label = format!(
-        "Last {} intervals: {} operational, {} degraded, {} down, {} pending",
-        bar_history.len(),
-        normal_count,
-        slow_count,
-        down_count,
-        pending_count
-    );
-    let uptime_bar_start_label = bar_history
-        .last()
-        .map(|record| format_chart_timestamp(record.checked_at_ms))
-        .unwrap_or_default();
-    let uptime_bar_end_label = bar_history
-        .first()
-        .map(|record| format_chart_timestamp(record.checked_at_ms))
-        .unwrap_or_default();
-    let uptime_bar = bar_history
-        .iter()
-        .rev()
-        .map(|record| uptime_segment(record, monitor.slow_response_threshold_ms))
-        .collect();
+    let (uptime_bar, uptime_bar_label, uptime_bar_start_label, uptime_bar_end_label) =
+        monitor_uptime_bar(
+            bar_history,
+            monitor.interval_seconds,
+            monitor.slow_response_threshold_ms,
+            normal_days,
+            samples_per_day,
+            now_ms,
+        );
 
     MonitorView {
         id: monitor.id.clone(),
@@ -754,7 +802,11 @@ fn monitor_view(
         exclude_from_aggregate_status: monitor.exclude_from_aggregate_status,
         show_target: !monitor.hide_target,
         kind: kind.to_owned(),
-        target,
+        target: if monitor.hide_target {
+            String::new()
+        } else {
+            target
+        },
         interval_seconds: monitor.interval_seconds,
         response_threshold_label: monitor
             .slow_response_threshold_ms
@@ -850,39 +902,6 @@ fn scheduled_check_history(
     scheduled
 }
 
-fn uptime_segment(record: &CheckRecord, threshold_ms: Option<u64>) -> UptimeSegment {
-    let (status_class, status_label) = record_status(record, threshold_ms);
-    let response_time = record
-        .latency_ms
-        .map(format_milliseconds)
-        .unwrap_or_else(|| "—".to_owned());
-    let mut title = format!(
-        "{} · {} · {}",
-        format_timestamp(record.checked_at_ms),
-        status_label,
-        response_time
-    );
-    if record.is_pending {
-        title.push_str(" · ");
-        title.push_str(&record.message);
-    }
-    UptimeSegment {
-        status_class: status_class.to_owned(),
-        title: title
-            + &record
-                .http_timings
-                .as_ref()
-                .map(|timings| {
-                    format!(
-                        " · {} · Total {}",
-                        format_http_timing_summary(timings),
-                        format_timing(timings.total_ms)
-                    )
-                })
-                .unwrap_or_default(),
-    }
-}
-
 fn redact_url_query(raw: &str) -> String {
     url::Url::parse(raw)
         .map(|mut url| {
@@ -899,14 +918,8 @@ fn public_record_message(monitor: &MonitorConfig, record: &CheckRecord) -> Strin
     }
 
     if record.is_degraded {
-        let exceeded_latency_threshold =
-            monitor.slow_response_threshold_ms.is_some_and(|threshold| {
-                record
-                    .latency_ms
-                    .is_some_and(|latency| latency > threshold as f64)
-            });
-        return if exceeded_latency_threshold {
-            "Response exceeded slow_ms".to_owned()
+        return if response_timing_exceeded(monitor, record) {
+            "Response timing exceeded slow_ms".to_owned()
         } else {
             "Service reported degraded status".to_owned()
         };
@@ -955,6 +968,10 @@ fn public_record_message(monitor: &MonitorConfig, record: &CheckRecord) -> Strin
             tcp_failure_message(monitor, record, send_message.is_some())
         }
     }
+}
+
+fn response_timing_exceeded(monitor: &MonitorConfig, record: &CheckRecord) -> bool {
+    is_slow_response(record, monitor.slow_response_threshold_ms)
 }
 
 fn tcp_failure_message(monitor: &MonitorConfig, record: &CheckRecord, is_exchange: bool) -> String {
@@ -1007,55 +1024,43 @@ fn tcp_failure_message(monitor: &MonitorConfig, record: &CheckRecord, is_exchang
     }
 }
 
-fn history_view(monitor: &MonitorConfig, record: &CheckRecord) -> HistoryView {
-    let (status_class, status_label) = record_status(record, monitor.slow_response_threshold_ms);
-    HistoryView {
-        checked_at: format_timestamp(record.checked_at_ms),
-        status_class: status_class.to_owned(),
-        status_label: status_label.to_owned(),
-        response_time: record
-            .latency_ms
-            .map(format_milliseconds)
-            .unwrap_or_else(|| "—".to_owned()),
-        status_code: record
-            .status_code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "—".to_owned()),
-        message: public_record_message(monitor, record),
-        tcp_response: record.tcp_response.as_deref().map(format_tcp_response),
-        tcp_response_truncated: record.tcp_response_truncated,
-    }
-}
-
-fn format_tcp_response(response: &[u8]) -> String {
-    match std::str::from_utf8(response) {
-        Ok(response) => response.to_owned(),
-        Err(_) => {
-            let preview = response
-                .iter()
-                .take(256)
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if response.len() > 256 {
-                format!(
-                    "Binary response ({} bytes; first 256 bytes in hex): {preview} …",
-                    response.len()
-                )
-            } else {
-                format!(
-                    "Binary response ({} bytes in hex): {preview}",
-                    response.len()
-                )
-            }
-        }
-    }
+pub(super) fn japan_datetime(timestamp_ms: i64) -> Option<DateTime<FixedOffset>> {
+    let japan_offset = FixedOffset::east_opt(9 * 60 * 60)?;
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|date| date.with_timezone(&japan_offset))
 }
 
 fn format_timestamp(timestamp_ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
-        .map(|date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+    japan_datetime(timestamp_ms)
+        .map(|date| date.format("%Y-%m-%d %H:%M:%S JST").to_string())
         .unwrap_or_else(|| "—".to_owned())
+}
+
+fn format_duration_ago(seconds: u64) -> String {
+    let units = [
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    let mut remaining = seconds;
+    let mut parts = Vec::new();
+
+    for (unit_seconds, unit_name) in units {
+        let value = remaining / unit_seconds;
+        if value > 0 || (parts.is_empty() && unit_seconds == 1) {
+            parts.push(format!(
+                "{value} {unit_name}{}",
+                if value == 1 { "" } else { "s" }
+            ));
+            remaining %= unit_seconds;
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+
+    format!("{} ago", parts.join(" "))
 }
 
 fn error_page(title: &str, message: &str) -> String {
@@ -1075,69 +1080,6 @@ fn render<T: Serialize>(name: &str, context: &T) -> Result<String, minijinja::Er
     )?;
     env.add_template("detail.html", include_str!("../templates/detail.html"))?;
     env.get_template(name)?.render(Serde(context))
-}
-
-#[derive(Serialize)]
-struct DashboardContext {
-    app_name: String,
-    page_title: String,
-    generated_at: String,
-    status_total_count: usize,
-    normal_count: usize,
-    down_count: usize,
-    slow_count: usize,
-    pending_count: usize,
-    overall_status_class: String,
-    overall_status_label: String,
-    groups: Vec<MonitorGroupView>,
-}
-
-#[derive(Serialize)]
-struct MonitorGroupView {
-    name: String,
-    show_group_status: bool,
-    total_count: usize,
-    status_total_count: usize,
-    normal_count: usize,
-    down_count: usize,
-    slow_count: usize,
-    pending_count: usize,
-    status_class: String,
-    status_label: String,
-    uptime_bar: Vec<UptimeSegment>,
-    uptime_bar_label: String,
-    uptime_bar_caption: String,
-    uptime_bar_start_label: String,
-    uptime_bar_end_label: String,
-    monitors: Vec<MonitorView>,
-}
-
-struct GroupMonitorData {
-    view: MonitorView,
-    history: Vec<CheckRecord>,
-    interval_seconds: u64,
-    slow_response_threshold_ms: Option<u64>,
-    exclude_from_aggregate_status: bool,
-    order: Option<i64>,
-    config_index: usize,
-}
-
-#[derive(Serialize)]
-struct DetailContext {
-    app_name: String,
-    page_title: String,
-    monitor: MonitorView,
-    response_chart: ResponseTimeChart,
-    metric_groups: Vec<MetricGroupView>,
-    response_time_stats: ResponseTimeStats,
-    is_http_monitor: bool,
-    http_timing: Option<HttpTimingView>,
-    is_tcp_monitor: bool,
-    tcp_exchange_enabled: bool,
-    has_tcp_check: bool,
-    latest_tcp_response: Option<String>,
-    latest_tcp_response_truncated: bool,
-    history: Vec<HistoryView>,
 }
 
 #[derive(Serialize)]
@@ -1167,16 +1109,4 @@ struct MonitorView {
 struct UptimeSegment {
     status_class: String,
     title: String,
-}
-
-#[derive(Serialize)]
-struct HistoryView {
-    checked_at: String,
-    status_class: String,
-    status_label: String,
-    response_time: String,
-    status_code: String,
-    message: String,
-    tcp_response: Option<String>,
-    tcp_response_truncated: bool,
 }

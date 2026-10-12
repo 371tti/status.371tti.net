@@ -1,22 +1,29 @@
 use std::{
     fs::{self, File},
     io::{self, BufReader},
+    mem::size_of,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 
 use crate::{http_probe::HttpTimings, monitor::CheckResult};
 
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
     chunk_minutes: u32,
     retention_days: u32,
+    chunk_cache: Cache<PathBuf, Arc<Vec<CheckRecord>>>,
+    chunk_io_lock: Arc<RwLock<()>>,
+    cache_enabled: bool,
 }
 
 impl Store {
@@ -24,6 +31,7 @@ impl Store {
         path: impl AsRef<Path>,
         chunk_minutes: u32,
         retention_days: u32,
+        cache_max_mb: u32,
     ) -> io::Result<Self> {
         if !(1..=1440).contains(&chunk_minutes) || 1440 % chunk_minutes != 0 {
             return Err(io::Error::new(
@@ -39,10 +47,20 @@ impl Store {
         }
         let root = path.as_ref().to_owned();
         fs::create_dir_all(&root)?;
+        let cache_max_bytes = u64::from(cache_max_mb) * BYTES_PER_MIB;
+        let chunk_cache = Cache::builder()
+            .max_capacity(cache_max_bytes)
+            .weigher(|_path: &PathBuf, records: &Arc<Vec<CheckRecord>>| {
+                estimated_chunk_memory_bytes(records)
+            })
+            .build();
         let store = Self {
             root,
             chunk_minutes,
             retention_days,
+            chunk_cache,
+            chunk_io_lock: Arc::new(RwLock::new(())),
+            cache_enabled: cache_max_mb > 0,
         };
         store.delete_expired_sync(Utc::now().timestamp_millis())?;
         Ok(store)
@@ -52,8 +70,14 @@ impl Store {
         validate_monitor_id(&result.monitor_id)?;
         let root = self.root.clone();
         let chunk_minutes = self.chunk_minutes;
+        let chunk_cache = self.chunk_cache.clone();
+        let chunk_io_lock = Arc::clone(&self.chunk_io_lock);
+        let cache_enabled = self.cache_enabled;
         let record = CheckRecord::from(result);
         tokio::task::spawn_blocking(move || {
+            let _chunk_io_guard = chunk_io_lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = chunk_path(
                 &root,
                 &record.monitor_id,
@@ -65,81 +89,112 @@ impl Store {
             })?;
             fs::create_dir_all(parent)?;
 
-            let mut records = match read_chunk(&path) {
-                Ok(records) => records,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error),
+            let mut records = match cache_enabled.then(|| chunk_cache.get(&path)).flatten() {
+                Some(records) => records.as_ref().clone(),
+                None => match read_chunk(&path) {
+                    Ok(records) => records,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => return Err(error),
+                },
             };
             records.push(record);
-            write_chunk(&path, &records)
+            write_chunk(&path, &records)?;
+            if cache_enabled {
+                chunk_cache.insert(path, Arc::new(records));
+                chunk_cache.run_pending_tasks();
+            }
+            Ok(())
         })
         .await
         .map_err(io::Error::other)?
     }
 
-    pub async fn history(&self, monitor_id: &str, limit: usize) -> io::Result<Vec<CheckRecord>> {
+    pub async fn history_range(
+        &self,
+        monitor_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> io::Result<Vec<CheckRecord>> {
         validate_monitor_id(monitor_id)?;
-        if limit == 0 {
+        let start_ms = start_ms.max(cutoff_millis(self.retention_days));
+        let end_ms = end_ms.min(Utc::now().timestamp_millis());
+        if start_ms >= end_ms {
             return Ok(Vec::new());
         }
 
         let root = self.root.clone();
         let monitor_id = monitor_id.to_owned();
-        let retention_days = self.retention_days;
+        let chunk_cache = self.chunk_cache.clone();
+        let chunk_io_lock = Arc::clone(&self.chunk_io_lock);
+        let cache_enabled = self.cache_enabled;
         tokio::task::spawn_blocking(move || {
-            let cutoff_ms = cutoff_millis(retention_days);
             let monitor_dir = root.join(monitor_id);
-            let mut chunks = collect_chunk_paths(&monitor_dir)?;
-            chunks.sort_unstable_by(|left, right| right.cmp(left));
+            if !monitor_dir.exists() {
+                return Ok(Vec::new());
+            }
 
-            let mut history = Vec::with_capacity(limit);
-            for path in chunks {
-                let mut records = read_chunk(&path)?;
-                records.sort_unstable_by_key(|record| record.checked_at_ms);
-                for record in records.into_iter().rev() {
-                    if record.checked_at_ms < cutoff_ms {
+            let mut history = Vec::new();
+            for year_entry in fs::read_dir(&monitor_dir)? {
+                let year_entry = year_entry?;
+                if !year_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                for date_entry in fs::read_dir(year_entry.path())? {
+                    let date_entry = date_entry?;
+                    if !date_entry.file_type()?.is_dir() {
                         continue;
                     }
-                    history.push(record);
-                    if history.len() == limit {
-                        return Ok(history);
+                    let Some(date_name) = date_entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    let Ok(date) = NaiveDate::parse_from_str(&date_name, "%Y-%m-%d") else {
+                        continue;
+                    };
+                    let Some(day_start) = date
+                        .and_hms_opt(0, 0, 0)
+                        .map(|datetime| datetime.and_utc().timestamp_millis())
+                    else {
+                        continue;
+                    };
+                    let day_end = day_start.saturating_add(MILLIS_PER_DAY);
+                    if day_end <= start_ms || day_start >= end_ms {
+                        continue;
+                    }
+                    for path in collect_day_chunks(&date_entry.path())? {
+                        let records = {
+                            let _chunk_io_guard = chunk_io_lock
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if cache_enabled {
+                                match chunk_cache.get(&path) {
+                                    Some(records) => records,
+                                    None => {
+                                        let records = Arc::new(read_chunk(&path)?);
+                                        chunk_cache.insert(path.clone(), Arc::clone(&records));
+                                        records
+                                    }
+                                }
+                            } else {
+                                Arc::new(read_chunk(&path)?)
+                            }
+                        };
+                        history.extend(
+                            records
+                                .iter()
+                                .filter(|record| {
+                                    record.checked_at_ms >= start_ms
+                                        && record.checked_at_ms < end_ms
+                                })
+                                .cloned(),
+                        );
                     }
                 }
             }
+            if cache_enabled {
+                chunk_cache.run_pending_tasks();
+            }
+            history.sort_unstable_by(|left, right| right.checked_at_ms.cmp(&left.checked_at_ms));
             Ok(history)
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
-
-    pub async fn normal_percent(
-        &self,
-        monitor_id: &str,
-        days: u32,
-        slow_response_threshold_ms: Option<u64>,
-    ) -> io::Result<Option<f64>> {
-        validate_monitor_id(monitor_id)?;
-        let root = self.root.clone();
-        let monitor_id = monitor_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let cutoff_ms = cutoff_millis(days);
-            let chunks = collect_chunk_paths(&root.join(monitor_id))?;
-            let mut total = 0u64;
-            let mut normal = 0u64;
-            for path in chunks {
-                for record in read_chunk(&path)? {
-                    if record.checked_at_ms >= cutoff_ms {
-                        total += 1;
-                        let slow = slow_response_threshold_ms.is_some_and(|threshold| {
-                            record
-                                .latency_ms
-                                .is_some_and(|latency| latency > threshold as f64)
-                        }) || record.is_degraded;
-                        normal += u64::from(record.is_up && !slow);
-                    }
-                }
-            }
-            Ok((total != 0).then(|| normal as f64 * 100.0 / total as f64))
         })
         .await
         .map_err(io::Error::other)?
@@ -148,9 +203,19 @@ impl Store {
     pub async fn delete_expired(&self) -> io::Result<()> {
         let root = self.root.clone();
         let cutoff_ms = cutoff_millis(self.retention_days);
-        tokio::task::spawn_blocking(move || delete_expired_from(&root, cutoff_ms))
-            .await
-            .map_err(io::Error::other)?
+        let chunk_cache = self.chunk_cache.clone();
+        let chunk_io_lock = Arc::clone(&self.chunk_io_lock);
+        tokio::task::spawn_blocking(move || {
+            let _chunk_io_guard = chunk_io_lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            delete_expired_from(&root, cutoff_ms)?;
+            chunk_cache.invalidate_all();
+            chunk_cache.run_pending_tasks();
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     fn delete_expired_sync(&self, now_ms: i64) -> io::Result<()> {
@@ -262,6 +327,33 @@ fn read_chunk(path: &Path) -> io::Result<Vec<CheckRecord>> {
     })
 }
 
+fn estimated_chunk_memory_bytes(records: &Arc<Vec<CheckRecord>>) -> u32 {
+    let map_link_overhead = 4 * size_of::<usize>();
+    let mut bytes = size_of::<Arc<Vec<CheckRecord>>>()
+        .saturating_add(size_of::<Vec<CheckRecord>>())
+        .saturating_add(records.capacity().saturating_mul(size_of::<CheckRecord>()));
+    for record in records.iter() {
+        bytes = bytes
+            .saturating_add(record.monitor_id.capacity())
+            .saturating_add(record.message.capacity())
+            .saturating_add(record.tcp_response.as_ref().map_or(0, Vec::capacity));
+        for key in record.metrics.keys() {
+            bytes = bytes
+                .saturating_add(size_of::<(String, f64)>())
+                .saturating_add(map_link_overhead)
+                .saturating_add(key.capacity());
+        }
+        for (key, value) in &record.metric_units {
+            bytes = bytes
+                .saturating_add(size_of::<(String, String)>())
+                .saturating_add(map_link_overhead)
+                .saturating_add(key.capacity())
+                .saturating_add(value.capacity());
+        }
+    }
+    bytes.clamp(1, u32::MAX as usize) as u32
+}
+
 fn write_chunk(path: &Path, records: &[CheckRecord]) -> io::Result<()> {
     AtomicFile::new(path, AllowOverwrite)
         .write(|file| {
@@ -269,27 +361,6 @@ fn write_chunk(path: &Path, records: &[CheckRecord]) -> io::Result<()> {
                 .map_err(|error| io::Error::other(error.to_string()))
         })
         .map_err(|error| io::Error::other(error.to_string()))
-}
-
-fn collect_chunk_paths(monitor_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    if !monitor_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = Vec::new();
-    for year_entry in fs::read_dir(monitor_dir)? {
-        let year_entry = year_entry?;
-        if !year_entry.file_type()?.is_dir() {
-            continue;
-        }
-        for date_entry in fs::read_dir(year_entry.path())? {
-            let date_entry = date_entry?;
-            if !date_entry.file_type()?.is_dir() {
-                continue;
-            }
-            paths.extend(collect_day_chunks(&date_entry.path())?);
-        }
-    }
-    Ok(paths)
 }
 
 fn collect_day_chunks(day_dir: &Path) -> io::Result<Vec<PathBuf>> {

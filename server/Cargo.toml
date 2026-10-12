@@ -13,9 +13,11 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "rustls-platform-verifier", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-kurosabi = { version = "0.6.20", default-features = false, features = ["tokio-server"] }
+kurosabi = { version = "0.6.20", default-features = false, features = ["tokio-server", "logging"] }
 minijinja = { version = "3", features = ["serde"] }
+moka = { version = "0.12", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
 surge-ping = "0.9"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }

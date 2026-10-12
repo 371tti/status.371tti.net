@@ -23,6 +23,7 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi_sanitization(false)
         .with_target(false)
         .compact()
         .init();
@@ -38,6 +39,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         &config.storage.path,
         config.storage.chunk_minutes,
         config.storage.retention_days,
+        config.storage.cache_max_mb,
     )?;
     info!(
         config_path = %config_path.display(),
@@ -49,6 +51,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         storage_path = %config.storage.path,
         chunk_minutes = config.storage.chunk_minutes,
         retention_days = config.storage.retention_days,
+        cache_max_mb = config.storage.cache_max_mb,
         "history storage ready"
     );
     start_tasks(&config, store.clone());

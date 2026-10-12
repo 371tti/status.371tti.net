@@ -189,6 +189,9 @@ async fn run_check(
         target
             .latency_ms
             .is_some_and(|latency| latency > threshold as f64)
+            || telemetry.metrics.iter().any(|(key, value)| {
+                key.starts_with("response.") && key != "response.ms" && *value > threshold as f64
+            })
     });
     let service_status_code = telemetry.status_code.unwrap_or({
         if telemetry.invalid_status_code || !target.is_up || !target.response_received {
@@ -266,6 +269,17 @@ fn parse_key_values(body: &[u8]) -> ParsedKeyValues {
                     parsed.invalid_status_code = true;
                 }
             }
+        } else if key == "response.ms" {
+            // Response time is measured by this monitor; ignore remote overrides.
+            continue;
+        } else if key.starts_with("response.") {
+            if (parsed.metrics.contains_key(key) || parsed.metrics.len() < MAX_METRIC_COUNT)
+                && let Ok(value) = value.parse::<f64>()
+                && value.is_finite()
+                && value >= 0.0
+            {
+                parsed.metrics.insert(key.to_owned(), value);
+            }
         } else if let Some(group) = key.strip_suffix(".unit") {
             if unit_value_is_valid(value)
                 && (parsed.metric_units.contains_key(group)
@@ -333,7 +347,7 @@ fn classify_service_status(
             Some(ResponseCodeStatus::Operational) if slow => (
                 true,
                 true,
-                format!("status.code {code}; response exceeded slow_ms"),
+                format!("status.code {code}; response timing exceeded slow_ms"),
             ),
             Some(ResponseCodeStatus::Operational) => (true, false, String::new()),
             Some(ResponseCodeStatus::Degraded) => (
@@ -353,7 +367,7 @@ fn classify_service_status(
             ),
         }
     } else if slow {
-        (true, true, "Response exceeded slow_ms".to_owned())
+        (true, true, "Response timing exceeded slow_ms".to_owned())
     } else {
         (true, false, String::new())
     }
@@ -510,12 +524,9 @@ async fn check_target(
                 let mut found_address = false;
                 for address in addresses {
                     found_address = true;
-                    match tokio::net::TcpStream::connect(address).await {
-                        Ok(connected_stream) => {
-                            stream = Some(connected_stream);
-                            break;
-                        }
-                        Err(_) => {}
+                    if let Ok(connected_stream) = tokio::net::TcpStream::connect(address).await {
+                        stream = Some(connected_stream);
+                        break;
                     }
                 }
                 let mut stream = stream.ok_or(if found_address {

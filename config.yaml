@@ -8,6 +8,13 @@ storage:
   path: data/records
   chunk_minutes: 5
   retention_days: 30
+  # Cache capacity in MiB; 0 disables it.
+  cache_max_mb: 256
+
+# Each status bar has retention_days × samples_per_day segments.
+# With 30 days and 3 samples/day, each bar contains 90 segments.
+status_bar:
+  samples_per_day: 3
 
 # Optional status messages; blank or omitted values use built-in defaults.
 # status_messages:
@@ -38,6 +45,43 @@ monitors:
     slow_ms: 100
     status_codes: [200, 204]
     headers: {}
+
+  - id: "server.host-pve"
+    name: "host-server"
+    type: tcp
+    host: "192.168.0.254"
+    port: 9791
+    interval: 60
+    timeout: 5
+    slow_ms: 500
+    hide_target: true
+    exclude_status: false
+    send: "METRICS 33053ab63c32a6ff12d7ae47ac1422e244bb88c1f7b4ea6e\n"
+    order: 200
+    max_bytes: 16384
+    response_codes:
+      0: operational
+      1: degraded
+      2: down
+
+  - id: "discord-bot.nelfie"
+    name: "nelfie"
+    type: tcp
+    host: "192.168.0.26"
+    port: 9791
+    interval: 60
+    timeout: 5
+    slow_ms: 500
+    hide_target: true
+    exclude_status: false
+    send: "METRICS\n"
+    response_end: "\n\n"
+    order: 200
+    max_bytes: 16384
+    response_codes:
+      0: operational
+      1: degraded
+      2: down
 
   - id: web.dev.371tti.net
     name: dev.371tti.net

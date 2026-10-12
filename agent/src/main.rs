@@ -7,7 +7,7 @@ mod linux {
         fs,
         io::{self, Read, Write as IoWrite},
         net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-        path::{Path, PathBuf},
+        path::{Component, Path, PathBuf},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -517,12 +517,13 @@ mod linux {
                 {
                     return read_cgroup_memory(path);
                 }
-                if !state.lxcfs_proc.meminfo {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "container-scoped memory data is unavailable",
-                    ));
+                if state.lxcfs_proc.meminfo {
+                    return read_memory();
                 }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "container-scoped memory data is unavailable",
+                ));
             }
             read_memory()
         });
@@ -1320,7 +1321,19 @@ mod linux {
     }
 
     fn map_cgroup_path(mount: &CgroupMountInfo, membership: &str) -> Option<PathBuf> {
-        let relative = Path::new(membership).strip_prefix(&mount.root).ok()?;
+        let membership = Path::new(membership);
+        let relative = membership
+            .strip_prefix(&mount.root)
+            .ok()
+            // In a cgroup namespace, /proc/<pid>/cgroup is relative to that
+            // namespace root even when mountinfo exposes the host-side root.
+            .or_else(|| membership.strip_prefix("/").ok())?;
+        if relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+        {
+            return None;
+        }
         Some(mount.mountpoint.join(relative))
     }
 
