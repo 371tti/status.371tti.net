@@ -73,6 +73,11 @@ load_config() {
   ENABLE_MEMORY="1"
   ENABLE_LOAD="1"
   ENABLE_NETWORK="1"
+  WARN_CPU_PERCENT="90"
+  WARN_MEMORY_PERCENT="90"
+  WARN_IOWAIT_PERCENT="20"
+  WARN_NIC_ERROR_DROP_PERCENT="1"
+  STATUS_NETWORK_MIN_PACKETS="100"
   if [[ -r "$CONFIG_FILE" ]]; then
     while IFS='=' read -r key value; do
       case "$key" in
@@ -83,6 +88,11 @@ load_config() {
         WS371_AGENT_ENABLE_MEMORY) ENABLE_MEMORY="$value" ;;
         WS371_AGENT_ENABLE_LOAD) ENABLE_LOAD="$value" ;;
         WS371_AGENT_ENABLE_NETWORK) ENABLE_NETWORK="$value" ;;
+        WS371_AGENT_WARN_CPU_PERCENT) WARN_CPU_PERCENT="$value" ;;
+        WS371_AGENT_WARN_MEMORY_PERCENT) WARN_MEMORY_PERCENT="$value" ;;
+        WS371_AGENT_WARN_IOWAIT_PERCENT) WARN_IOWAIT_PERCENT="$value" ;;
+        WS371_AGENT_WARN_NIC_ERROR_DROP_PERCENT) WARN_NIC_ERROR_DROP_PERCENT="$value" ;;
+        WS371_AGENT_STATUS_NETWORK_MIN_PACKETS) STATUS_NETWORK_MIN_PACKETS="$value" ;;
       esac
     done < "$CONFIG_FILE"
   fi
@@ -130,6 +140,12 @@ validate_configuration() {
   for setting in "$ENABLE_CPU" "$ENABLE_MEMORY" "$ENABLE_LOAD" "$ENABLE_NETWORK"; do
     [[ "$setting" == "0" || "$setting" == "1" ]] || fail "Metric enable settings must be 1 or 0."
   done
+  for setting in "$WARN_CPU_PERCENT" "$WARN_MEMORY_PERCENT" "$WARN_IOWAIT_PERCENT" "$WARN_NIC_ERROR_DROP_PERCENT"; do
+    if ! valid_percent_threshold "$setting"; then
+      fail "Status warning thresholds must be greater than 0 and at most 100 percent, or 'off'."
+    fi
+  done
+  [[ "$STATUS_NETWORK_MIN_PACKETS" =~ ^[1-9][0-9]{0,8}$ ]] || fail "Minimum network packets must be an integer from 1 to 999999999."
 }
 
 prompt_toggle() {
@@ -148,6 +164,42 @@ prompt_toggle() {
     n|no|0|off) value="0" ;;
     *) fail "Choose yes or no for: $label" ;;
   esac
+  printf -v "$setting_name" '%s' "$value"
+}
+
+prompt_status_threshold() {
+  local setting_name="$1"
+  local label="$2"
+  local current="${!setting_name}"
+  local answer value
+  read -r -p "$label percent [${current}] (off disables): " answer
+  value="${answer:-$current}"
+  if [[ "${value,,}" == "off" ]]; then
+    value="off"
+  elif ! valid_percent_threshold "$value"; then
+    fail "$label must be greater than 0 and at most 100 percent, or 'off'."
+  fi
+  printf -v "$setting_name" '%s' "$value"
+}
+
+valid_percent_threshold() {
+  local value="${1,,}"
+  [[ "$value" == "off" ]] && return 0
+  awk -v threshold="$value" 'BEGIN {
+    if (threshold !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+    value = threshold + 0
+    if (value <= 0 || value > 100) exit 1
+  }'
+}
+
+prompt_positive_integer() {
+  local setting_name="$1"
+  local label="$2"
+  local current="${!setting_name}"
+  local answer value
+  read -r -p "$label [${current}]: " answer
+  value="${answer:-$current}"
+  [[ "$value" =~ ^[1-9][0-9]{0,8}$ ]] || fail "$label must be an integer from 1 to 999999999."
   printf -v "$setting_name" '%s' "$value"
 }
 
@@ -181,6 +233,9 @@ show_monitor_config() {
   printf 'No response_end is set; the agent closes each connection after sending its metrics.\n'
   printf 'Enabled metrics: CPU=%s memory=%s load=%s network=%s\n' \
     "$ENABLE_CPU" "$ENABLE_MEMORY" "$ENABLE_LOAD" "$ENABLE_NETWORK"
+  printf 'Status warnings: CPU=%s%% memory=%s%% I/O wait=%s%% NIC error/drop=%s%% (minimum %s samples)\n' \
+    "$WARN_CPU_PERCENT" "$WARN_MEMORY_PERCENT" "$WARN_IOWAIT_PERCENT" \
+    "$WARN_NIC_ERROR_DROP_PERCENT" "$STATUS_NETWORK_MIN_PACKETS"
 }
 
 yaml_quote() {
@@ -344,6 +399,11 @@ configure() {
   prompt_toggle ENABLE_MEMORY "Enable memory metrics"
   prompt_toggle ENABLE_LOAD "Enable load average metrics"
   prompt_toggle ENABLE_NETWORK "Enable per-interface network metrics"
+  prompt_status_threshold WARN_CPU_PERCENT "Warn at CPU usage"
+  prompt_status_threshold WARN_MEMORY_PERCENT "Warn at memory usage"
+  prompt_status_threshold WARN_IOWAIT_PERCENT "Warn at I/O wait"
+  prompt_status_threshold WARN_NIC_ERROR_DROP_PERCENT "Warn at NIC error/drop ratio"
+  prompt_positive_integer STATUS_NETWORK_MIN_PACKETS "Minimum packet/error/drop samples for NIC evaluation"
 
   prompt_monitor_identity
   choose_monitor_host
@@ -358,6 +418,11 @@ configure() {
     printf 'WS371_AGENT_ENABLE_MEMORY=%s\n' "$ENABLE_MEMORY"
     printf 'WS371_AGENT_ENABLE_LOAD=%s\n' "$ENABLE_LOAD"
     printf 'WS371_AGENT_ENABLE_NETWORK=%s\n' "$ENABLE_NETWORK"
+    printf 'WS371_AGENT_WARN_CPU_PERCENT=%s\n' "$WARN_CPU_PERCENT"
+    printf 'WS371_AGENT_WARN_MEMORY_PERCENT=%s\n' "$WARN_MEMORY_PERCENT"
+    printf 'WS371_AGENT_WARN_IOWAIT_PERCENT=%s\n' "$WARN_IOWAIT_PERCENT"
+    printf 'WS371_AGENT_WARN_NIC_ERROR_DROP_PERCENT=%s\n' "$WARN_NIC_ERROR_DROP_PERCENT"
+    printf 'WS371_AGENT_STATUS_NETWORK_MIN_PACKETS=%s\n' "$STATUS_NETWORK_MIN_PACKETS"
   } > "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
   write_monitor_metadata

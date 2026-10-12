@@ -384,19 +384,22 @@ fn metric_chart(
 
 fn canonical_metric_key(key: &str) -> String {
     match key {
-        "cpu.percent.usage" => return "cpu.core.percent.all".to_owned(),
-        "cpu.percent.iowait" => return "cpu.core.iowait.all".to_owned(),
+        "cpu.percent.usage" => return "cpu.percent.all".to_owned(),
+        "cpu.percent.iowait" => return "cpu.iowait.all".to_owned(),
         _ => {}
     }
     if let Some(rest) = key.strip_prefix("cpu.core.") {
         if let Some((core, metric)) = rest.split_once(".percent.") {
             if core.bytes().all(|byte| byte.is_ascii_digit()) {
                 return match metric {
-                    "usage" => format!("cpu.core.percent.{core}"),
-                    "iowait" => format!("cpu.core.iowait.{core}"),
+                    "usage" => format!("cpu.percent.{core}"),
+                    "iowait" => format!("cpu.iowait.{core}"),
                     _ => key.to_owned(),
                 };
             }
+        }
+        if rest.starts_with("percent.") || rest.starts_with("iowait.") {
+            return format!("cpu.{rest}");
         }
     }
     let parts = key.split('.').collect::<Vec<_>>();
@@ -420,13 +423,34 @@ fn metric_value<'a>(record: &'a CheckRecord, canonical_key: &str) -> Option<&'a 
 }
 
 fn canonical_metric_unit_groups(group: &str) -> Vec<String> {
-    if group == "cpu.percent" {
-        return vec!["cpu.core.percent".to_owned(), "cpu.core.iowait".to_owned()];
+    if matches!(
+        group,
+        "cpu.percent" | "cpu.iowait" | "cpu.core.percent" | "cpu.core.iowait"
+    ) {
+        return [
+            "cpu.percent",
+            "cpu.iowait",
+            "cpu.core.percent",
+            "cpu.core.iowait",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     }
     if let Some(rest) = group.strip_prefix("cpu.core.") {
-        if let Some((core, "percent")) = rest.split_once('.') {
-            if core.bytes().all(|byte| byte.is_ascii_digit()) {
-                return vec!["cpu.core.percent".to_owned(), "cpu.core.iowait".to_owned()];
+        if let Some((core, metric)) = rest.split_once('.') {
+            if core.bytes().all(|byte| byte.is_ascii_digit())
+                && matches!(metric, "percent" | "iowait")
+            {
+                return [
+                    "cpu.percent",
+                    "cpu.iowait",
+                    "cpu.core.percent",
+                    "cpu.core.iowait",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
             }
         }
     }

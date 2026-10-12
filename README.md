@@ -35,6 +35,7 @@ storage:
 monitors:
   - id: production.web
     name: Web
+    order: 10
     type: http
     url: https://example.com/health
     interval: 60
@@ -43,18 +44,22 @@ monitors:
 
   - id: production.router
     name: Router
+    order: 20
     type: ping
     host: 192.0.2.1
     interval: 30
 
   - id: production.cache
     name: Cache
+    order: 30
     type: tcp
     host: cache.example
     port: 6379
     interval: 60
     timeout: 5
 ```
+
+`order` は監視一覧の表示順で、小さい値が先です。同じグループ内のサービスは個別の `order` で並び、グループ自体は所属サービスの最小 `order` で並びます。未指定のサービスは指定済みの後にconfig記述順で並び、未指定グループは指定済みグループの後に名前順で並びます。`Other` は常に最後です。
 
 `interval` と `timeout` は秒、`slow_ms` はミリ秒です（既定値500）。HTTPの許可ステータスとヘッダーは `status_codes` と `headers`、TCPの送信内容は `send` で設定します。`response_codes` は `status.code` をサービス状態に対応付けます（既定: `0` 正常、`1` 応答低下、`2` 停止）。
 
@@ -68,25 +73,36 @@ monitors:
 
 ```text
 status.code 0
-cpu.core.percent.all 12.34
-cpu.core.percent.0 14.50
-cpu.core.percent.1 10.25
-cpu.core.iowait.all 2.10
-cpu.core.iowait.0 0.40
+cpu.percent.all 12.34
+cpu.percent.limit 100
+cpu.percent.0 14.50
+cpu.percent.1 10.25
+cpu.iowait.all 2.10
+cpu.iowait.limit 100
+cpu.iowait.0 0.40
+memory.bytes.total 17179869184
+memory.percent.limit 100
 network.bytes.rx.unit B/s
 network.bytes.rx.eth0 1250000
 network.bytes.rx.eth1 240000
+network.error_drop.rx.percent.unit %
+network.error_drop.rx.percent.eth0 0.10
+network.error_drop.rx.percent.limit 100
 network.rx 1250000
 network.tx 2340000
 network.unit bytes/s
 ```
 
-`status.code` は状態判定用の予約キーです。その他の数値キーはグラフに表示され、最後のドットより前の部分でグループ化されます。`network.unit bytes/s` のように `<group>.unit <unit_text>` を返すと、そのグラフの見出しとホバー値に単位を表示します。応答に `status.code` がない場合は、応答の成否と `slow_ms` から判定します。
+`status.code` は状態判定用の予約キーです。その他の数値キーはグラフに表示され、最後のドットより前の部分でグループ化されます。`*.limit` はグラフに上限線を表示する系列です。`network.unit bytes/s` のように `<group>.unit <unit_text>` を返すと、そのグラフの見出しとホバー値に単位を表示します。応答に `status.code` がない場合は、応答の成否と `slow_ms` から判定します。
 グラフや応答時間の大きな値は `1.2k`、`3.4M` のように表示します。
+
+外部ソフトウェアからTCPで監視情報を返す場合の接続手順、応答形式、予約キー、制限は[TCP Key-Value Monitoring Protocol](docs/tcp-monitor-protocol.md)を参照してください。
 
 ## Linux agent
 
-`agent/` はLinux用TCPデーモンです。CPU系列は `cpu.core.percent.all` と `cpu.core.percent.<コア番号>`、I/O waitは `cpu.core.iowait.*` にまとめて同じグラフへ表示します。ネットワークも `network.bytes.rx.<interface>` のように出し、方向・値ごとに全インターフェースを同じグラフへ重ねます。VMではゲストOSの `/proc` を使います。LXCなどのコンテナでは環境を検出し、CPU・メモリはcgroup v1/v2の値を優先します。LXCFSの `/proc/stat` が使える場合はコア別CPUも取得します。コンテナ内のload averageやhost-wideなuptimeなど、範囲を特定できない値は出しません。I/O waitはカーネルが公開する値のため目安として扱ってください。ReleaseのLinuxアーカイブにはバイナリとinstallerが含まれます。単体の `.sh` はGitHub Releaseから最新バイナリを取得します。
+`agent/` はLinux用TCPデーモンです。CPU系列は `cpu.percent.all` と `cpu.percent.<コア番号>`、I/O waitは `cpu.iowait.*` にまとめて表示します。CPU使用率・I/O waitを有効にすると上限線 `*.limit 100` を出します。メモリ上限は取得できる場合 `memory.bytes.total`、割合の上限は `memory.percent.limit 100` で示します。ネットワークは `network.bytes.rx.<interface>` などを出し、`network.error_drop.rx.percent.<interface>` と `network.error_drop.tx.percent.<interface>` はNICカウンターのdrop/error比率を示します。これはNICで観測した値で、経路全体の実パケットロス測定ではありません。VMではゲストOSの `/proc` を使います。LXCなどのコンテナでは環境を検出し、CPU・メモリはcgroup v1/v2の値を優先します。cgroup v1が `cpuacct.usage_percpu` を公開する場合はコア別CPUも取得します。cgroup v2はCPU合計値のみのため、コア別値にはLXCFSの `/proc/stat` が必要です。コンテナ内のload averageやhost-wideなuptimeなど、範囲を特定できない値は出しません。I/O waitはカーネルが公開する値のため目安として扱ってください。
+
+agentはCPU・メモリ・I/O wait・NIC drop/error比率を設定閾値と比較し、閾値以上または計測エラーを `status.code 1`（劣化）として返します。警告がなく計測に問題がなければ `0` です。既定閾値はCPU 90%、メモリ90%、I/O wait20%、NIC drop/error比率1%です。NIC判定は各方向・interfaceごとに、成功packet・error・dropの合計が100件以上のサンプルで行います。比率は `(errors + drops) / (successful_packets + errors + drops)` です。`sudo bash ./install.sh configure` で0%超〜100%（小数可）の閾値を設定でき、`off` で個別に無効化できます。agentは `status.code 2` を返しません。TCP応答がない場合は監視サーバー側が停止として扱います。ネットワーク速度とdrop/error比率は前回値との比較ができる2回目以降に出ます。ReleaseのLinuxアーカイブにはバイナリとinstallerが含まれます。単体の `.sh` はGitHub Releaseから最新バイナリを取得します。
 
 ```bash
 curl -fL https://github.com/371tti/status.371tti.net/releases/latest/download/wk-status-371tti-net-agent.sh -o install.sh

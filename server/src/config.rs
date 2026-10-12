@@ -38,6 +38,9 @@ storage:
 # (without the leading `#`) underneath it. IDs sharing a prefix are grouped.
 # `interval` and `timeout` are seconds. `slow_ms` defaults to 500 ms; set null to disable it.
 # IDs without a dot appear under "Other".
+# `order` is optional; lower values appear first within a group. A group's order is its lowest
+# member order; groups with an order come first, then unordered groups alphabetically. "Other" stays last.
+# Monitors without an order follow ordered monitors in config file order.
 # Set `hide_target: true` on a monitor to hide its target from the public detail page.
 # Numeric response keys are graphed. `<group>.unit <text>` labels that graph group and is not graphed.
 # For example, `network.rx 1250000`, `network.tx 2340000`, `network.unit bytes/s`.
@@ -46,6 +49,7 @@ monitors: []
 # HTTP/S with key-value metrics in the response body:
 #   - id: production.api
 #     name: Production API
+#     order: 10
 #     type: http
 #     url: https://service.example/health
 #     method: GET
@@ -65,6 +69,7 @@ monitors: []
 # ICMP Ping (grouped with production.api):
 #   - id: production.database
 #     name: Production Database Host
+#     order: 20
 #     type: ping
 #     host: 192.0.2.10
 #     interval: 60
@@ -74,6 +79,7 @@ monitors: []
 # Development monitors remain visible but do not affect group or overall status:
 #   - id: development.web
 #     name: Development Web
+#     order: 40
 #     type: http
 #     url: https://dev.example/health
 #     exclude_status: true
@@ -81,6 +87,7 @@ monitors: []
 # TCP port check (grouped with production.api):
 #   - id: production.cache
 #     name: Production Cache
+#     order: 30
 #     type: tcp
 #     host: cache.example
 #     port: 6379
@@ -94,8 +101,8 @@ monitors: []
 #     # Maximum captured response size in bytes (default 16384, maximum 65536).
 #     max_bytes: 16384
 #     # Key-value lines are parsed from the response, including status.code.
-#     # Example: cpu.core.percent.unit %, cpu.core.percent.all 12.5,
-#     #          cpu.core.percent.0 14.5, memory.bytes.unit B,
+#     # Example: cpu.percent.unit %, cpu.percent.all 12.5,
+#     #          cpu.percent.0 14.5, memory.bytes.unit B,
 #     #          memory.bytes.used 536870912, system.load.unit tasks, system.load.1 0.42
 #     #          network.bytes.rx.unit B/s, network.bytes.rx.eth0 1250000
 #     response_codes:
@@ -113,8 +120,8 @@ monitors: []
 #     timeout: 5
 #     slow_ms: 500
 #     send: "METRICS <token>\n"
-#     # The agent returns status.code and grouped keys such as cpu.core.percent.all,
-#     # cpu.core.percent.0, memory.bytes.used, and network.bytes.rx.<interface>.
+#     # The agent returns status.code and grouped keys such as cpu.percent.all,
+#     # cpu.percent.0, memory.bytes.used, and network.bytes.rx.<interface>.
 #     response_codes:
 #       0: operational
 #       1: degraded
@@ -414,6 +421,8 @@ impl Default for StorageConfig {
 pub struct MonitorConfig {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub order: Option<i64>,
     #[serde(
         default = "default_interval_seconds",
         rename = "interval",

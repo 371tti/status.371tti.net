@@ -10,7 +10,7 @@ mod linux {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread,
@@ -30,7 +30,9 @@ mod linux {
         environment: RuntimeEnvironment,
         cgroups: Option<CgroupResources>,
         lxcfs_proc: LxcfsProcFiles,
+        status_thresholds: StatusThresholds,
         cpu_metrics: Option<Arc<Mutex<Option<CpuMetrics>>>>,
+        cpu_sampler_error: Option<Arc<AtomicBool>>,
         network_previous: Mutex<Option<NetworkSnapshot>>,
     }
 
@@ -99,6 +101,14 @@ mod linux {
         network: bool,
     }
 
+    struct StatusThresholds {
+        cpu_percent: Option<f64>,
+        memory_percent: Option<f64>,
+        iowait_percent: Option<f64>,
+        nic_error_drop_percent: Option<f64>,
+        network_min_packets: u64,
+    }
+
     struct ConnectionPermit(Arc<AtomicUsize>);
 
     impl Drop for ConnectionPermit {
@@ -138,7 +148,11 @@ mod linux {
 
     enum CpuSample {
         Proc(CpuSnapshot),
-        Cgroup { usage_ns: u64, capacity_cores: f64 },
+        Cgroup {
+            usage_ns: u64,
+            capacity_cores: f64,
+            cores: Option<BTreeMap<usize, u64>>,
+        },
     }
 
     struct TimedCpuSample {
@@ -174,7 +188,11 @@ mod linux {
         rx_bytes_per_second: f64,
         tx_bytes_per_second: f64,
         rx_packets_per_second: f64,
+        rx_error_drop_percent: f64,
+        rx_observed_packets: u64,
         tx_packets_per_second: f64,
+        tx_error_drop_percent: f64,
+        tx_observed_packets: u64,
         rx_errors_per_second: f64,
         tx_errors_per_second: f64,
         rx_drops_per_second: f64,
@@ -184,6 +202,26 @@ mod linux {
     struct NetworkSample {
         interface_count: usize,
         interfaces: BTreeMap<String, NetworkRates>,
+    }
+
+    impl NetworkSample {
+        fn maximum_error_drop_percent(&self, minimum_packets: u64) -> Option<f64> {
+            let mut maximum = None::<f64>;
+            for rates in self.interfaces.values() {
+                for (observed_packets, error_drop_percent) in [
+                    (rates.rx_observed_packets, rates.rx_error_drop_percent),
+                    (rates.tx_observed_packets, rates.tx_error_drop_percent),
+                ] {
+                    if observed_packets >= minimum_packets {
+                        maximum = Some(
+                            maximum
+                                .map_or(error_drop_percent, |value| value.max(error_drop_percent)),
+                        );
+                    }
+                }
+            }
+            maximum
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn Error>> {
@@ -213,6 +251,16 @@ mod linux {
             load: read_env_flag("WS371_AGENT_ENABLE_LOAD", true)?,
             network: read_env_flag("WS371_AGENT_ENABLE_NETWORK", true)?,
         };
+        let status_thresholds = StatusThresholds {
+            cpu_percent: read_percent_threshold("WS371_AGENT_WARN_CPU_PERCENT", 90.0)?,
+            memory_percent: read_percent_threshold("WS371_AGENT_WARN_MEMORY_PERCENT", 90.0)?,
+            iowait_percent: read_percent_threshold("WS371_AGENT_WARN_IOWAIT_PERCENT", 20.0)?,
+            nic_error_drop_percent: read_percent_threshold(
+                "WS371_AGENT_WARN_NIC_ERROR_DROP_PERCENT",
+                1.0,
+            )?,
+            network_min_packets: read_positive_u64("WS371_AGENT_STATUS_NETWORK_MIN_PACKETS", 100)?,
+        };
         let lxcfs_proc = detect_lxcfs_proc_files();
         let environment = detect_runtime_environment(lxcfs_proc);
         let cgroups = environment
@@ -236,11 +284,15 @@ mod linux {
         if options.cpu && cpu_source.is_none() {
             eprintln!("CPU metrics are unavailable: no container-scoped CPU source was found");
         }
+        let mut cpu_sampler_error = None;
         let cpu_metrics = if options.cpu {
             if let Some(cpu_source) = cpu_source {
                 let metrics = Arc::new(Mutex::new(None));
-                let cpu_sample_ready = start_cpu_sampler(Arc::clone(&metrics), cpu_source);
+                let sample_error = Arc::new(AtomicBool::new(false));
+                let cpu_sample_ready =
+                    start_cpu_sampler(Arc::clone(&metrics), Arc::clone(&sample_error), cpu_source);
                 let _ = cpu_sample_ready.recv_timeout(Duration::from_secs(3));
+                cpu_sampler_error = Some(sample_error);
                 Some(metrics)
             } else {
                 None
@@ -265,7 +317,9 @@ mod linux {
             environment,
             cgroups,
             lxcfs_proc,
+            status_thresholds,
             cpu_metrics,
+            cpu_sampler_error,
             network_previous: Mutex::new(network_previous),
         });
         let active_connections = Arc::new(AtomicUsize::new(0));
@@ -312,6 +366,53 @@ mod linux {
             "0" | "false" | "no" | "off" => Ok(false),
             _ => Err(format!("{name} must be set to 1 or 0").into()),
         }
+    }
+
+    fn read_percent_threshold(name: &str, default: f64) -> Result<Option<f64>, Box<dyn Error>> {
+        let Some(value) = std::env::var_os(name) else {
+            return Ok(Some(default));
+        };
+        let value = value.to_string_lossy();
+        if value.trim().eq_ignore_ascii_case("off") {
+            return Ok(None);
+        }
+        let threshold = value.parse::<f64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{name} must be a percentage greater than 0 and at most 100, or 'off': {error}"
+                ),
+            )
+        })?;
+        if !threshold.is_finite() || !(threshold > 0.0 && threshold <= 100.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a percentage greater than 0 and at most 100, or 'off'"),
+            )
+            .into());
+        }
+        Ok(Some(threshold))
+    }
+
+    fn read_positive_u64(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
+        let Some(value) = std::env::var_os(name) else {
+            return Ok(default);
+        };
+        let value = value.to_string_lossy();
+        let count = value.parse::<u64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer: {error}"),
+            )
+        })?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer"),
+            )
+            .into());
+        }
+        Ok(count)
     }
 
     fn socket_address(bind: &str, port: u16) -> Result<SocketAddr, Box<dyn Error>> {
@@ -431,6 +532,10 @@ mod linux {
         let network = state.options.network.then(|| sample_network(state));
         let mut status_code = 0;
         if (state.options.cpu && cpu_metrics.is_none())
+            || state
+                .cpu_sampler_error
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Relaxed))
             || memory.as_ref().is_some_and(Result::is_err)
             || uptime.as_ref().is_some_and(Result::is_err)
             || load.as_ref().is_some_and(Result::is_err)
@@ -438,45 +543,79 @@ mod linux {
         {
             status_code = 1;
         }
+        if status_code == 0
+            && status_threshold_exceeded(
+                &state.status_thresholds,
+                cpu_metrics.as_ref(),
+                memory.as_ref(),
+                network.as_ref(),
+            )
+        {
+            status_code = 1;
+        }
+
+        let memory_limit = if state.options.memory {
+            memory
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|memory| memory.total_bytes)
+                .or_else(|| memory_capacity_bytes(state))
+        } else {
+            None
+        };
 
         let mut output = String::new();
         let _ = writeln!(output, "status.code {status_code}");
-        if let Some(cpu_metrics) = cpu_metrics {
-            if !cpu_metrics.cores.is_empty() {
-                let _ = writeln!(output, "cpu.cores.unit cores");
-                let _ = writeln!(output, "cpu.cores.count {}", cpu_metrics.cores.len());
-            }
-            let _ = writeln!(output, "cpu.core.percent.unit %");
-            let _ = writeln!(
-                output,
-                "cpu.core.percent.all {:.2}",
-                cpu_metrics.aggregate.usage
-            );
-            let _ = writeln!(output, "cpu.core.iowait.unit %");
-            if let Some(iowait) = cpu_metrics.aggregate.iowait {
-                let _ = writeln!(output, "cpu.core.iowait.all {iowait:.2}");
-            }
-            for (core, percentages) in cpu_metrics.cores {
-                let _ = writeln!(output, "cpu.core.percent.{core} {:.2}", percentages.usage);
-                if let Some(iowait) = percentages.iowait {
-                    let _ = writeln!(output, "cpu.core.iowait.{core} {iowait:.2}");
+        if state.options.cpu {
+            let _ = writeln!(output, "cpu.percent.unit %");
+            let _ = writeln!(output, "cpu.percent.limit 100");
+            let _ = writeln!(output, "cpu.iowait.unit %");
+            let _ = writeln!(output, "cpu.iowait.limit 100");
+            if let Some(cpu_metrics) = cpu_metrics {
+                if !cpu_metrics.cores.is_empty() {
+                    let _ = writeln!(output, "cpu.cores.unit cores");
+                    let _ = writeln!(output, "cpu.cores.count {}", cpu_metrics.cores.len());
+                }
+                let _ = writeln!(output, "cpu.percent.all {:.2}", cpu_metrics.aggregate.usage);
+                if let Some(iowait) = cpu_metrics.aggregate.iowait {
+                    let _ = writeln!(output, "cpu.iowait.all {iowait:.2}");
+                }
+                for (core, percentages) in cpu_metrics.cores {
+                    let _ = writeln!(output, "cpu.percent.{core} {:.2}", percentages.usage);
+                    if let Some(iowait) = percentages.iowait {
+                        let _ = writeln!(output, "cpu.iowait.{core} {iowait:.2}");
+                    }
                 }
             }
         }
-        if let Some(Ok(memory)) = memory.as_ref() {
+        if state.options.memory {
             let _ = writeln!(output, "memory.bytes.unit B");
+            let _ = writeln!(output, "memory.percent.unit %");
+            let _ = writeln!(output, "memory.percent.limit 100");
+            if let Some(total_bytes) = memory_limit {
+                let _ = writeln!(output, "memory.bytes.total {total_bytes}");
+            }
+        }
+        if state.options.network {
+            for group in [
+                "network.error_drop.rx.percent",
+                "network.error_drop.tx.percent",
+            ] {
+                let _ = writeln!(output, "{group}.unit %");
+                let _ = writeln!(output, "{group}.limit 100");
+            }
+        }
+        if let Some(Ok(memory)) = memory.as_ref() {
             let _ = writeln!(output, "memory.bytes.used {}", memory.used_bytes);
-            if let (Some(total_bytes), Some(available_bytes)) =
-                (memory.total_bytes, memory.available_bytes)
-            {
+            if let Some(available_bytes) = memory.available_bytes {
+                let _ = writeln!(output, "memory.bytes.available {available_bytes}");
+            }
+            if let Some(total_bytes) = memory.total_bytes.or(memory_limit) {
                 let usage_percent = if total_bytes == 0 {
                     0.0
                 } else {
                     (memory.used_bytes as f64 * 100.0 / total_bytes as f64).clamp(0.0, 100.0)
                 };
-                let _ = writeln!(output, "memory.bytes.available {available_bytes}");
-                let _ = writeln!(output, "memory.bytes.total {total_bytes}");
-                let _ = writeln!(output, "memory.percent.unit %");
                 let _ = writeln!(output, "memory.percent.usage {usage_percent:.2}");
             }
         }
@@ -547,6 +686,16 @@ mod linux {
                     "network.drops.tx.{interface} {:.2}",
                     rates.tx_drops_per_second
                 );
+                let _ = writeln!(
+                    output,
+                    "network.error_drop.rx.percent.{interface} {:.2}",
+                    rates.rx_error_drop_percent
+                );
+                let _ = writeln!(
+                    output,
+                    "network.error_drop.tx.percent.{interface} {:.2}",
+                    rates.tx_error_drop_percent
+                );
             }
         }
         if let Some(Ok(uptime)) = uptime {
@@ -560,6 +709,47 @@ mod linux {
             state.started_at.elapsed().as_secs_f64()
         );
         output
+    }
+
+    fn status_threshold_exceeded(
+        thresholds: &StatusThresholds,
+        cpu: Option<&CpuMetrics>,
+        memory: Option<&io::Result<Memory>>,
+        network: Option<&io::Result<Option<NetworkSample>>>,
+    ) -> bool {
+        if let Some(cpu) = cpu {
+            if thresholds
+                .cpu_percent
+                .is_some_and(|threshold| cpu.aggregate.usage >= threshold)
+                || thresholds.iowait_percent.is_some_and(|threshold| {
+                    cpu.aggregate.iowait.is_some_and(|value| value >= threshold)
+                })
+            {
+                return true;
+            }
+        }
+
+        if let Some(threshold) = thresholds.memory_percent {
+            if memory
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|memory| memory.total_bytes.map(|total| (memory.used_bytes, total)))
+                .is_some_and(|(used, total)| {
+                    total > 0 && used as f64 * 100.0 / total as f64 >= threshold
+                })
+            {
+                return true;
+            }
+        }
+
+        thresholds.nic_error_drop_percent.is_some_and(|threshold| {
+            network
+                .and_then(|result| result.as_ref().ok())
+                .and_then(Option::as_ref)
+                .and_then(|sample| {
+                    sample.maximum_error_drop_percent(thresholds.network_min_packets)
+                })
+                .is_some_and(|value| value >= threshold)
+        })
     }
 
     fn sample_network(state: &State) -> io::Result<Option<NetworkSample>> {
@@ -578,6 +768,16 @@ mod linux {
                 .iter()
                 .filter_map(|(name, current)| {
                     let previous = previous.interfaces.get(name)?;
+                    let rx_packets = counter_delta(current.rx_packets, previous.rx_packets);
+                    let rx_errors = counter_delta(current.rx_errors, previous.rx_errors);
+                    let rx_drops = counter_delta(current.rx_drops, previous.rx_drops);
+                    let tx_packets = counter_delta(current.tx_packets, previous.tx_packets);
+                    let tx_errors = counter_delta(current.tx_errors, previous.tx_errors);
+                    let tx_drops = counter_delta(current.tx_drops, previous.tx_drops);
+                    let rx_failed = rx_errors.saturating_add(rx_drops);
+                    let tx_failed = tx_errors.saturating_add(tx_drops);
+                    let rx_observed_packets = rx_packets.saturating_add(rx_failed);
+                    let tx_observed_packets = tx_packets.saturating_add(tx_failed);
                     Some((
                         name.clone(),
                         NetworkRates {
@@ -591,36 +791,22 @@ mod linux {
                                 previous.tx_bytes,
                                 elapsed_seconds,
                             ),
-                            rx_packets_per_second: counter_rate(
-                                current.rx_packets,
-                                previous.rx_packets,
-                                elapsed_seconds,
+                            rx_packets_per_second: delta_rate(rx_packets, elapsed_seconds),
+                            rx_error_drop_percent: counter_error_percent(
+                                rx_failed,
+                                rx_observed_packets,
                             ),
-                            tx_packets_per_second: counter_rate(
-                                current.tx_packets,
-                                previous.tx_packets,
-                                elapsed_seconds,
+                            rx_observed_packets,
+                            tx_packets_per_second: delta_rate(tx_packets, elapsed_seconds),
+                            tx_error_drop_percent: counter_error_percent(
+                                tx_failed,
+                                tx_observed_packets,
                             ),
-                            rx_errors_per_second: counter_rate(
-                                current.rx_errors,
-                                previous.rx_errors,
-                                elapsed_seconds,
-                            ),
-                            tx_errors_per_second: counter_rate(
-                                current.tx_errors,
-                                previous.tx_errors,
-                                elapsed_seconds,
-                            ),
-                            rx_drops_per_second: counter_rate(
-                                current.rx_drops,
-                                previous.rx_drops,
-                                elapsed_seconds,
-                            ),
-                            tx_drops_per_second: counter_rate(
-                                current.tx_drops,
-                                previous.tx_drops,
-                                elapsed_seconds,
-                            ),
+                            tx_observed_packets,
+                            rx_errors_per_second: delta_rate(rx_errors, elapsed_seconds),
+                            tx_errors_per_second: delta_rate(tx_errors, elapsed_seconds),
+                            rx_drops_per_second: delta_rate(rx_drops, elapsed_seconds),
+                            tx_drops_per_second: delta_rate(tx_drops, elapsed_seconds),
                         },
                     ))
                 })
@@ -639,6 +825,22 @@ mod linux {
 
     fn counter_rate(current: u64, previous: u64, elapsed_seconds: f64) -> f64 {
         current.saturating_sub(previous) as f64 / elapsed_seconds
+    }
+
+    fn counter_delta(current: u64, previous: u64) -> u64 {
+        current.saturating_sub(previous)
+    }
+
+    fn delta_rate(delta: u64, elapsed_seconds: f64) -> f64 {
+        delta as f64 / elapsed_seconds
+    }
+
+    fn counter_error_percent(errors_and_drops: u64, observed_packets: u64) -> f64 {
+        if observed_packets == 0 {
+            0.0
+        } else {
+            errors_and_drops as f64 * 100.0 / observed_packets as f64
+        }
     }
 
     fn metric_segment(name: &str) -> String {
@@ -700,21 +902,35 @@ mod linux {
 
     fn start_cpu_sampler(
         metrics: Arc<Mutex<Option<CpuMetrics>>>,
+        sample_error: Arc<AtomicBool>,
         source: CpuSamplerSource,
     ) -> mpsc::Receiver<()> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         thread::Builder::new()
             .name("cpu-sampler".to_owned())
             .spawn(move || {
-                let mut previous = read_cpu_sample(&source).ok().map(|sample| TimedCpuSample {
-                    sampled_at: Instant::now(),
-                    sample,
-                });
+                let mut previous = match read_cpu_sample(&source) {
+                    Ok(sample) => Some(TimedCpuSample {
+                        sampled_at: Instant::now(),
+                        sample,
+                    }),
+                    Err(_) => {
+                        sample_error.store(true, Ordering::Relaxed);
+                        None
+                    }
+                };
                 let mut ready_sender = Some(ready_sender);
                 loop {
                     thread::sleep(Duration::from_secs(1));
-                    let Ok(sample) = read_cpu_sample(&source) else {
-                        continue;
+                    let sample = match read_cpu_sample(&source) {
+                        Ok(sample) => {
+                            sample_error.store(false, Ordering::Relaxed);
+                            sample
+                        }
+                        Err(_) => {
+                            sample_error.store(true, Ordering::Relaxed);
+                            continue;
+                        }
                     };
                     let current = TimedCpuSample {
                         sampled_at: Instant::now(),
@@ -740,10 +956,11 @@ mod linux {
         match source {
             CpuSamplerSource::Proc => read_cpu_times().map(CpuSample::Proc),
             CpuSamplerSource::Cgroup(path) => {
-                let (usage_ns, capacity_cores) = read_cgroup_cpu(path)?;
+                let (usage_ns, capacity_cores, cores) = read_cgroup_cpu(path)?;
                 Ok(CpuSample::Cgroup {
                     usage_ns,
                     capacity_cores,
+                    cores,
                 })
             }
         }
@@ -769,11 +986,13 @@ mod linux {
             (
                 CpuSample::Cgroup {
                     usage_ns: previous_usage,
+                    cores: previous_cores,
                     ..
                 },
                 CpuSample::Cgroup {
                     usage_ns: current_usage,
                     capacity_cores,
+                    cores: current_cores,
                 },
             ) => {
                 let elapsed_ns = current
@@ -785,12 +1004,35 @@ mod linux {
                 }
                 let usage_percent = current_usage.saturating_sub(*previous_usage) as f64 * 100.0
                     / (elapsed_ns * capacity_cores);
+                let cores = previous_cores
+                    .as_ref()
+                    .zip(current_cores.as_ref())
+                    .map(|(previous_cores, current_cores)| {
+                        current_cores
+                            .iter()
+                            .filter_map(|(core, current_usage)| {
+                                let previous_usage = previous_cores.get(core)?;
+                                Some((
+                                    *core,
+                                    CpuPercentages {
+                                        usage: (current_usage.saturating_sub(*previous_usage)
+                                            as f64
+                                            * 100.0
+                                            / elapsed_ns)
+                                            .clamp(0.0, 100.0),
+                                        iowait: None,
+                                    },
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(CpuMetrics {
                     aggregate: CpuPercentages {
                         usage: usage_percent.clamp(0.0, 100.0),
                         iowait: None,
                     },
-                    cores: BTreeMap::new(),
+                    cores,
                 })
             }
             _ => None,
@@ -1184,7 +1426,9 @@ mod linux {
         (cpu.is_some() || memory.is_some()).then_some(CgroupResources { cpu, memory })
     }
 
-    fn read_cgroup_cpu(path: &CgroupCpuPath) -> io::Result<(u64, f64)> {
+    fn read_cgroup_cpu(
+        path: &CgroupCpuPath,
+    ) -> io::Result<(u64, f64, Option<BTreeMap<usize, u64>>)> {
         match path {
             CgroupCpuPath::V2(directory) => {
                 let contents = fs::read_to_string(directory.join("cpu.stat"))?;
@@ -1202,6 +1446,7 @@ mod linux {
                 Ok((
                     usage_usec.saturating_mul(1_000),
                     cgroup_v2_capacity(directory),
+                    None,
                 ))
             }
             CgroupCpuPath::V1 {
@@ -1210,9 +1455,33 @@ mod linux {
                 cpuset,
             } => {
                 let usage_ns = read_u64_file(&cpuacct.join("cpuacct.usage"))?;
+                let cores = read_u64_list_file(&cpuacct.join("cpuacct.usage_percpu"))
+                    .ok()
+                    .map(|usage| {
+                        let possible = read_possible_cpu_ids(usage.len());
+                        let allowed = cpuset
+                            .as_deref()
+                            .and_then(|directory| ancestor_cpuset_ids(directory, "cpuset.cpus"));
+                        usage
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(index, usage_ns)| {
+                                let core = possible.get(index).copied().unwrap_or(index);
+                                if allowed
+                                    .as_ref()
+                                    .is_some_and(|allowed| !allowed.contains(&core))
+                                {
+                                    None
+                                } else {
+                                    Some((core, usage_ns))
+                                }
+                            })
+                            .collect()
+                    });
                 Ok((
                     usage_ns,
                     cgroup_v1_capacity(cpu.as_deref(), cpuset.as_deref()),
+                    cores,
                 ))
             }
         }
@@ -1231,7 +1500,9 @@ mod linux {
                 (used, limit)
             }
         };
-        let total_bytes = configured_limit.filter(|limit| *limit > 0);
+        let total_bytes = configured_limit
+            .filter(|limit| *limit > 0)
+            .or_else(|| read_total_memory_bytes().ok());
         Ok(Memory {
             total_bytes,
             used_bytes,
@@ -1269,6 +1540,22 @@ mod linux {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
+    fn read_u64_list_file(path: &Path) -> io::Result<Vec<u64>> {
+        let contents = fs::read_to_string(path)?;
+        let values = contents
+            .split_ascii_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if values.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty per-core CPU counters",
+            ));
+        }
+        Ok(values)
+    }
+
     fn cgroup_v2_capacity(directory: &Path) -> f64 {
         let cpus = ancestor_cpuset_count(directory, "cpuset.cpus.effective")
             .or_else(|| ancestor_cpuset_count(directory, "cpuset.cpus"));
@@ -1304,6 +1591,28 @@ mod linux {
             current = path.parent();
         }
         None
+    }
+
+    fn ancestor_cpuset_ids(directory: &Path, filename: &str) -> Option<BTreeSet<usize>> {
+        let mut current = Some(directory);
+        while let Some(path) = current {
+            if let Ok(value) = fs::read_to_string(path.join(filename)) {
+                if let Some(ids) = parse_cpu_set_ids(value.trim()) {
+                    return Some(ids);
+                }
+            }
+            current = path.parent();
+        }
+        None
+    }
+
+    fn read_possible_cpu_ids(counter_count: usize) -> Vec<usize> {
+        fs::read_to_string("/sys/devices/system/cpu/possible")
+            .ok()
+            .and_then(|value| parse_cpu_set_ids(value.trim()))
+            .filter(|ids| ids.len() == counter_count)
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_else(|| (0..counter_count).collect())
     }
 
     fn ancestor_quota(directory: &Path, filename: &str, v2: bool) -> Option<f64> {
@@ -1347,25 +1656,66 @@ mod linux {
         minimum
     }
 
-    fn parse_cpu_set_count(value: &str) -> Option<usize> {
+    fn parse_cpu_set_ids(value: &str) -> Option<BTreeSet<usize>> {
         if value.is_empty() {
             return None;
         }
-        let mut count = 0usize;
+        let mut ids = BTreeSet::new();
         for part in value.split(',') {
             if let Some((first, last)) = part.split_once('-') {
                 let first = first.trim().parse::<usize>().ok()?;
                 let last = last.trim().parse::<usize>().ok()?;
-                if last < first {
+                if last < first || last.saturating_sub(first) > 65_536 {
                     return None;
                 }
-                count = count.saturating_add(last - first + 1);
+                ids.extend(first..=last);
             } else {
-                part.trim().parse::<usize>().ok()?;
-                count = count.saturating_add(1);
+                ids.insert(part.trim().parse::<usize>().ok()?);
             }
         }
-        (count > 0).then_some(count)
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    fn parse_cpu_set_count(value: &str) -> Option<usize> {
+        parse_cpu_set_ids(value).map(|ids| ids.len())
+    }
+
+    fn read_total_memory_bytes() -> io::Result<u64> {
+        let contents = fs::read_to_string("/proc/meminfo")?;
+        let total_kib = contents
+            .lines()
+            .find_map(|line| {
+                let (key, rest) = line.split_once(':')?;
+                (key == "MemTotal")
+                    .then(|| rest.split_ascii_whitespace().next()?.parse::<u64>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing MemTotal"))?;
+        Ok(total_kib.saturating_mul(1024))
+    }
+
+    fn memory_capacity_bytes(state: &State) -> Option<u64> {
+        if state.environment.is_container() {
+            if let Some(path) = state
+                .cgroups
+                .as_ref()
+                .and_then(|resources| resources.memory.as_ref())
+            {
+                let configured_limit = match path {
+                    CgroupMemoryPath::V2(directory) => {
+                        ancestor_memory_limit(directory, "memory.max", true)
+                    }
+                    CgroupMemoryPath::V1(directory) => {
+                        ancestor_memory_limit(directory, "memory.limit_in_bytes", false)
+                    }
+                };
+                return configured_limit.or_else(|| read_total_memory_bytes().ok());
+            }
+            if !state.lxcfs_proc.meminfo {
+                return None;
+            }
+        }
+        read_total_memory_bytes().ok()
     }
 
     fn read_memory() -> io::Result<Memory> {

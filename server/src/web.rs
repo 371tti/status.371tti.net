@@ -172,7 +172,7 @@ async fn dashboard(state: &WebState) -> io::Result<String> {
     let mut status_total_count = 0usize;
     let now_ms = Utc::now().timestamp_millis();
 
-    for monitor in &state.config.monitors {
+    for (config_index, monitor) in state.config.monitors.iter().enumerate() {
         let records = state.store.history(&monitor.id, UPTIME_BAR_CHECKS).await?;
         let bar_history = scheduled_check_history(
             &records,
@@ -215,19 +215,34 @@ async fn dashboard(state: &WebState) -> io::Result<String> {
                 interval_seconds: monitor.interval_seconds,
                 slow_response_threshold_ms: monitor.slow_response_threshold_ms,
                 exclude_from_aggregate_status: monitor.exclude_from_aggregate_status,
+                order: monitor.order,
+                config_index,
             });
     }
 
     let mut groups = grouped_monitors
         .into_iter()
-        .map(|((name, is_ungrouped), monitors)| {
+        .map(|((name, is_ungrouped), mut monitors)| {
+            monitors.sort_by_key(|monitor| {
+                (
+                    monitor.order.is_none(),
+                    monitor.order.unwrap_or_default(),
+                    monitor.config_index,
+                )
+            });
+            let group_order = monitors.iter().filter_map(|monitor| monitor.order).min();
             (
-                is_ungrouped,
+                (
+                    is_ungrouped,
+                    group_order.is_none(),
+                    group_order.unwrap_or_default(),
+                    name.clone(),
+                ),
                 monitor_group_view(name, is_ungrouped, monitors, &state.config.status_messages),
             )
         })
         .collect::<Vec<_>>();
-    groups.sort_by_key(|(is_ungrouped, _)| *is_ungrouped);
+    groups.sort_by(|(left_order, _), (right_order, _)| left_order.cmp(right_order));
     let groups = groups
         .into_iter()
         .map(|(_, group)| group)
@@ -1103,6 +1118,8 @@ struct GroupMonitorData {
     interval_seconds: u64,
     slow_response_threshold_ms: Option<u64>,
     exclude_from_aggregate_status: bool,
+    order: Option<i64>,
+    config_index: usize,
 }
 
 #[derive(Serialize)]

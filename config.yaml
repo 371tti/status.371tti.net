@@ -21,12 +21,15 @@ storage:
 
 # Additional example monitors are commented out below.
 # IDs sharing the same prefix before the final dot appear in one group.
+# Optional `order` values put smaller numbers first; group order uses the lowest member value.
+# Ordered groups come first, then unordered groups alphabetically. Other stays last.
 # interval and timeout use seconds. slow_ms uses milliseconds (default 500; null disables it).
 # Numeric response keys are graphed. `<group>.unit <text>` labels that graph group.
 # IDs without a dot appear under "Other".
 monitors:
   - id: web.371tti-net
     name: 371tti.net
+    order: 10
     type: http
     url: https://371tti.net
     method: GET
@@ -38,6 +41,7 @@ monitors:
 
   - id: web.dev.371tti.net
     name: dev.371tti.net
+    order: 20
     type: http
     url: https://dev.371tti.net
     method: GET
@@ -50,6 +54,7 @@ monitors:
 
   - id: web.self.ping
     name: Status server
+    order: 30
     type: http
     url: http://127.0.0.1:85/ping
     method: GET
@@ -63,6 +68,7 @@ monitors:
 
   - id: web.proxy-server
     name: web-proxy-server
+    order: 40
     type: tcp
     host: 192.168.0.50
     port: 9791
@@ -125,8 +131,8 @@ monitors:
 #     timeout: 5
 #     slow_ms: 500
 #     send: "METRICS <token>\n"
-#     # The agent returns grouped metrics such as cpu.core.percent.all,
-#     # cpu.core.percent.0, memory.bytes.used, and network.bytes.rx.<interface>.
+#     # The agent returns grouped metrics such as cpu.percent.all,
+#     # cpu.percent.0, memory.bytes.used, and network.bytes.rx.<interface>.
 #     response_codes:
 #       0: operational
 #       1: degraded
